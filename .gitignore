@@ -18,3 +18,6 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# local notes
+CLAUDE.md

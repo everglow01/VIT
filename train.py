@@ -1,6 +1,8 @@
 import os
 import math
 import argparse
+import json
+from tqdm import tqdm
 
 import csv
 import torch
@@ -346,11 +348,24 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     best_metric = -1.0
     best_epoch = -1
 
+    printer = ConsolePrinter()
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
         n_batches = 0
-        for images, targets in train_loader:
+
+        print()
+        print(printer.train_header(colored=True))
+        print(f"[Train][epoch {epoch+1}/{args.epochs}] total_batches={len(train_loader)}")
+
+        pbar = tqdm(
+            train_loader,
+            dynamic_ncols=True,
+            bar_format=printer.BAR_FORMAT,
+            leave=True,
+        )
+        for images, targets in pbar:
+            img_size = int(images[0].shape[-1]) if images else 0
             images  = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -363,6 +378,10 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
 
             total_loss += loss.item()
             n_batches += 1
+
+            avg_loss = total_loss / n_batches
+            desc = printer.train_desc(epoch + 1, args.epochs, avg_loss, 0.0, img_size)
+            pbar.set_description_str(desc)
 
         scheduler.step()
         avg_loss = total_loss / max(n_batches, 1)
@@ -405,13 +424,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument('--task', type=str, default='classify',
+    parser.add_argument('--task', type=str, default='detect',
                         choices=['classify', 'detect', 'segment'],
                         help='Task type: classify | detect | segment')
 
     # ---- common ----
     parser.add_argument('--epochs',     type=int,   default=100)
-    parser.add_argument('--batch-size', type=int,   default=128)
+    parser.add_argument('--batch-size', type=int,   default=8)
     parser.add_argument('--lr',         type=float, default=0.001)
     parser.add_argument('--lrf',        type=float, default=0.01)
     parser.add_argument('--model',      type=str,   default="vit_base_patch16_224_in21k")
@@ -426,13 +445,13 @@ if __name__ == '__main__':
                         help='[classify] Dataset root directory (ImageFolder style)')
 
     # ---- detect / segment only ----
-    parser.add_argument('--train-img-dir',  type=str, default="",
+    parser.add_argument('--train-img-dir',  type=str, default="data/val2017",
                         help='[detect/segment] Training images directory')
-    parser.add_argument('--train-ann-file', type=str, default="",
+    parser.add_argument('--train-ann-file', type=str, default="data/annotations_trainval2017/annotations/instances_val2017.json",
                         help='[detect/segment] Training COCO annotation JSON')
-    parser.add_argument('--val-img-dir',    type=str, default="",
+    parser.add_argument('--val-img-dir',    type=str, default="data/val2017",
                         help='[detect/segment] Validation images directory')
-    parser.add_argument('--val-ann-file',   type=str, default="",
+    parser.add_argument('--val-ann-file',   type=str, default="data/annotations_trainval2017/annotations/instances_val2017.json",
                         help='[detect/segment] Validation COCO annotation JSON')
 
     opt = parser.parse_args()
