@@ -16,6 +16,7 @@ import model.vit_model as vit_models
 IMG_SIZE = 224
 MEAN = (0.5, 0.5, 0.5)
 STD  = (0.5, 0.5, 0.5)
+CONF_THRESH = 0.7
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp",
             ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
 
@@ -83,6 +84,67 @@ def load_class_indices(json_path: str) -> Optional[Dict[int, str]]:
         except Exception:
             pass
     return out if out else None
+
+
+def load_coco_label_map(ann_file: str) -> Optional[Dict[int, str]]:
+    """
+    Build contiguous 1-based label map from COCO categories.
+    Training dataset remaps sorted category ids -> labels [1..N].
+    """
+    if not ann_file or (not os.path.exists(ann_file)):
+        return None
+    with open(ann_file, "r", encoding="utf-8") as f:
+        ann = json.load(f)
+    categories = ann.get("categories", [])
+    if not categories:
+        return None
+
+    categories = sorted(categories, key=lambda c: int(c.get("id", 0)))
+    out: Dict[int, str] = {}
+    for i, cat in enumerate(categories, start=1):
+        out[i] = str(cat.get("name", i))
+    return out
+
+
+def normalize_detseg_class_map(class_map: Optional[Dict[int, str]], num_classes: int) -> Optional[Dict[int, str]]:
+    """
+    Ensure detect/segment class map uses 1-based contiguous labels [1..num_classes].
+    If user provides 0-based map [0..num_classes-1], shift it to 1-based.
+    """
+    if not class_map:
+        return None
+
+    expected_1_based = set(range(1, num_classes + 1))
+    keys = set(class_map.keys())
+    if keys == expected_1_based:
+        return class_map
+
+    expected_0_based = set(range(num_classes))
+    if keys == expected_0_based:
+        return {k + 1: v for k, v in class_map.items()}
+
+    return None
+
+
+def resolve_detseg_class_map(args, ckpt: Dict, num_classes: int) -> Optional[Dict[int, str]]:
+    """
+    Priority:
+    1) --class-indices (if valid for detect/segment labels)
+    2) COCO categories from --ann-file
+    3) COCO categories from checkpoint args (val/train ann file)
+    """
+    user_map = normalize_detseg_class_map(load_class_indices(args.class_indices), num_classes)
+    if user_map is not None:
+        return user_map
+
+    ann_file = args.ann_file
+    if (not ann_file) and isinstance(ckpt, dict):
+        old_args = ckpt.get("args", {})
+        if isinstance(old_args, dict):
+            ann_file = old_args.get("val_ann_file") or old_args.get("train_ann_file") or ""
+
+    coco_map = normalize_detseg_class_map(load_coco_label_map(ann_file), num_classes)
+    return coco_map
 
 
 def load_classify_checkpoint(weights_path: str, device: torch.device):
@@ -215,7 +277,7 @@ def run_detect(args, device, exp_folder):
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    class_map = load_class_indices(args.class_indices)
+    class_map = resolve_detseg_class_map(args, ckpt, num_classes)
     img_paths = collect_images(args.data)
     print(f"[INFO] Found {len(img_paths)} images.")
 
@@ -236,6 +298,11 @@ def run_detect(args, device, exp_folder):
             boxes  = out["boxes"].cpu().numpy()
             labels = out["labels"].cpu().numpy()
             scores = out["scores"].cpu().numpy()
+
+            keep = scores >= CONF_THRESH
+            boxes = boxes[keep]
+            labels = labels[keep]
+            scores = scores[keep]
 
             for box, label, score in zip(boxes, labels, scores):
                 x1, y1, x2, y2 = box
@@ -297,7 +364,7 @@ def run_segment(args, device, exp_folder):
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    class_map = load_class_indices(args.class_indices)
+    class_map = resolve_detseg_class_map(args, ckpt, num_classes)
     img_paths = collect_images(args.data)
     print(f"[INFO] Found {len(img_paths)} images.")
 
@@ -319,6 +386,12 @@ def run_segment(args, device, exp_folder):
             labels = out["labels"].cpu().numpy()
             scores = out["scores"].cpu().numpy()
             masks  = out["masks"].cpu().numpy()   # [N, 1, H, W]
+
+            keep = scores >= CONF_THRESH
+            boxes = boxes[keep]
+            labels = labels[keep]
+            scores = scores[keep]
+            masks = masks[keep]
 
             for box, label, score in zip(boxes, labels, scores):
                 x1, y1, x2, y2 = box
@@ -360,17 +433,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument("--task", type=str, default="classify",
+    parser.add_argument("--task", type=str, default="segment",
                         choices=["classify", "detect", "segment"])
 
     # ---- common ----
-    parser.add_argument("--data",       type=str, default="Plant_Leaf_Disease/Tomato__Tomato_Leaf_Mold")
-    parser.add_argument("--weights",    type=str, default="run/train/exp/weights/best.pth")
+    parser.add_argument("--data",       type=str, default="data/TOMATO.v5i.coco-segmentation/valid")
+    parser.add_argument("--weights",    type=str, default="run/train/exp16/weights/best.pth")
     parser.add_argument("--model-name", type=str, default="vit_base_patch16_224_in21k")
     parser.add_argument("--device",     type=str, default="cuda:0")
     parser.add_argument("--draw",       action="store_true", default=True)
-    parser.add_argument("--num-classes", type=int, default=None,
+    parser.add_argument("--num-classes", type=int, default=3,
                         help="Required for detect/segment; optional for classify")
+    parser.add_argument("--ann-file", type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json",
+                        help="Optional COCO annotation JSON for detect/segment class names")
 
     # ---- classify only ----
     parser.add_argument("--class-indices", type=str, default="run/train/exp/class_indices.json")

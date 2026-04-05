@@ -1,4 +1,4 @@
-# Vision Transformer for Classify, Detection and Sagement
+# Vision Transformer for Classify, Detection and Segmentation
 
 ## Important Notice (Non-Commercial Only)
 
@@ -28,6 +28,11 @@ It supports transfer learning from ImageNet-21k pretrained ViT weights and inclu
 - Auto-increment experiment folders (`run/train/expN`)
 - Metric plotting and confusion matrix generation
 - Prediction export for inference runs
+### About Detection
+The traditional VIT backbone was used, a YOLO-like FPN neck was added, and finally, a torch-style Fast R-CNN was used for the final regression and classification.
+
+### About Segmentation
+The same ViT + FPN backbone pipeline is used, and a Mask R-CNN style mask branch is added on top of the detection head to predict pixel-level instance masks together with box classification and regression.
 
 ## Project Structure
 

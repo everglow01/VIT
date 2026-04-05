@@ -441,13 +441,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument('--task', type=str, default='detect',
+    parser.add_argument('--task', type=str, default='segment',
                         choices=['classify', 'detect', 'segment'],
                         help='Task type: classify | detect | segment')
 
     # ---- common ----
     parser.add_argument('--epochs',     type=int,   default=100)
-    parser.add_argument('--batch-size', type=int,   default=8)
+    parser.add_argument('--batch-size', type=int,   default=4)
     parser.add_argument('--lr',         type=float, default=0.001)
     parser.add_argument('--lrf',        type=float, default=0.01)
     parser.add_argument('--model',      type=str,   default="vit_base_patch16_224_in21k")
@@ -464,13 +464,13 @@ if __name__ == '__main__':
                         help='[classify] Dataset root directory (ImageFolder style)')
 
     # ---- detect / segment only ----
-    parser.add_argument('--train-img-dir',  type=str, default="data/val2017",
+    parser.add_argument('--train-img-dir',  type=str, default="data/TOMATO.v5i.coco-segmentation/train",
                         help='[detect/segment] Training images directory')
-    parser.add_argument('--train-ann-file', type=str, default="data/annotations_trainval2017/annotations/instances_val2017.json",
+    parser.add_argument('--train-ann-file', type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_train.coco.json",
                         help='[detect/segment] Training COCO annotation JSON')
-    parser.add_argument('--val-img-dir',    type=str, default="data/val2017",
+    parser.add_argument('--val-img-dir',    type=str, default="data/TOMATO.v5i.coco-segmentation/valid",
                         help='[detect/segment] Validation images directory')
-    parser.add_argument('--val-ann-file',   type=str, default="data/annotations_trainval2017/annotations/instances_val2017.json",
+    parser.add_argument('--val-ann-file',   type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json",
                         help='[detect/segment] Validation COCO annotation JSON')
 
     opt = parser.parse_args()
