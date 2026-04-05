@@ -80,11 +80,11 @@ Use COCO-format data:
 ## Training
 
 ### tips
-1.For datasets with small amounts of data or small GPUs, it is recommended to freeze the backbone and use a pre-trained backbone.
-2.This model has high VRAM requirements. The default batch size may result in a "CUDA is out of memory" error. At least 8GB of VRAM is required, and batch sizes of 2-4 are recommended.
-3.The default evaluation method produces the same results when processing mAP50 and mAP50_90. If you need to switch to the native COCO dataset evaluation mode, you will need to manually modify the settings.
-4.The evaluation mode defaults to evaluating every ten rounds (or the last round). This was modified on my computer to reduce the reasoning burden. If needed, you can change the default to evaluating every round.
-
+1.For datasets with small amounts of data or small GPUs, it is recommended to freeze the backbone and use a pre-trained backbone.  
+2.This model has high VRAM requirements. The default batch size may result in a "CUDA is out of memory" error. At least 8GB of VRAM is required, and batch sizes of 2-4 are recommended.  
+3.The default evaluation method produces the same results when processing mAP50 and mAP50_90. If you need to switch to the native COCO dataset evaluation mode, you will need to manually modify the settings.  
+4.The evaluation mode defaults to evaluating every ten rounds (or the last round). This was modified on my computer to reduce the reasoning burden. If needed, you can change the default to evaluating every round.  
+5.The default label names come from your COCO dataset's JSON file. If the label names are incorrect, please check if your JSON file format and content are correct.   
 ### 1) Classification
 
 ```bash
