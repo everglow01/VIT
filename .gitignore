@@ -1,0 +1,20 @@
+# datasets & weights (large files)
+Plant_Leaf_Disease/
+weights/
+data/
+
+# training outputs
+run/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pth
+*.egg-info/
+dist/
+build/
+.env
+
+# IDE
+.vscode/
+.idea/
