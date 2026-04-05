@@ -21,3 +21,6 @@ build/
 
 # local notes
 CLAUDE.md
+
+# local stats
+class_counts.csv
