@@ -102,6 +102,7 @@ python train.py \
   --model vit_base_patch16_224_in21k \
   --weights weights/jx_vit_base_patch16_224_in21k-e5005f0a.pth \
   --epochs 100 \
+  --eval-interval 10 \
   --batch-size 8 \
   --device cuda:0
 ```
@@ -118,6 +119,7 @@ python train.py \
   --model vit_base_patch16_224_in21k \
   --weights weights/jx_vit_base_patch16_224_in21k-e5005f0a.pth \
   --epochs 100 \
+  --eval-interval 10 \
   --batch-size 8 \
   --device cuda:0
 ```
@@ -145,6 +147,7 @@ python train.py \
   --val-img-dir data/val2017 \
   --val-ann-file data/annotations_trainval2017/annotations/instances_val2017.json \
   --epochs 1 \
+  --eval-interval 1 \
   --batch-size 2 \
   --device cuda:0
 ```

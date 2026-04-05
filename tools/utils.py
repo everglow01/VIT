@@ -421,7 +421,10 @@ def evaluate_detection(model, data_loader, device, iou_thresh: float = 0.5):
 
     iou_thresholds = np.linspace(0.5, 0.95, 10)
 
-    for images, targets in data_loader:
+    pbar = tqdm(data_loader, file=sys.stdout, dynamic_ncols=True,
+                desc="detect-eval", leave=True)
+
+    for images, targets in pbar:
         images = [img.to(device) for img in images]
         outputs = model(images)
 
@@ -485,7 +488,10 @@ def evaluate_segmentation(model, data_loader, device, iou_thresh: float = 0.5):
     box_tp, box_conf, box_pred_cls, box_gt_cls = [], [], [], []
     mask_tp = []
 
-    for images, targets in data_loader:
+    pbar = tqdm(data_loader, file=sys.stdout, dynamic_ncols=True,
+                desc="segment-eval", leave=True)
+
+    for images, targets in pbar:
         images = [img.to(device) for img in images]
         outputs = model(images)
 

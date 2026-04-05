@@ -347,6 +347,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     best_ckpt_path = os.path.join(weights_folder, "best.pth")
     best_metric = -1.0
     best_epoch = -1
+    eval_interval = max(1, int(args.eval_interval))
 
     printer = ConsolePrinter()
     for epoch in range(args.epochs):
@@ -387,23 +388,39 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         avg_loss = total_loss / max(n_batches, 1)
         lr_now = optimizer.param_groups[0]["lr"]
 
+        do_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == args.epochs)
+
         if task == "detect":
-            metrics = evaluate_detection(model, val_loader, device)
-            map50    = metrics["mAP50"]
-            map50_95 = metrics["mAP50_95"]
-            print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  mAP50={map50:.4f}  mAP50-95={map50_95:.4f}  lr={lr_now:.6f}")
-            with open(metrics_path, "a", newline="") as f:
-                csv.writer(f).writerow([epoch, avg_loss, map50, map50_95, lr_now])
-            primary = map50
+            if do_eval:
+                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running detection evaluation...")
+                metrics = evaluate_detection(model, val_loader, device)
+                map50    = metrics["mAP50"]
+                map50_95 = metrics["mAP50_95"]
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  mAP50={map50:.4f}  mAP50-95={map50_95:.4f}  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([epoch, avg_loss, map50, map50_95, lr_now])
+                primary = map50
+            else:
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  eval=skipped (every {eval_interval} epochs)  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([epoch, avg_loss, "", "", lr_now])
+                primary = None
         else:
-            metrics = evaluate_segmentation(model, val_loader, device)
-            print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
-                  f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
-            with open(metrics_path, "a", newline="") as f:
-                csv.writer(f).writerow([epoch, avg_loss,
-                                        metrics["box_mAP50"], metrics["box_mAP50_95"],
-                                        metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now])
-            primary = metrics["mask_mAP50"]
+            if do_eval:
+                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running segmentation evaluation...")
+                metrics = evaluate_segmentation(model, val_loader, device)
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
+                      f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([epoch, avg_loss,
+                                            metrics["box_mAP50"], metrics["box_mAP50_95"],
+                                            metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now])
+                primary = metrics["mask_mAP50"]
+            else:
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  eval=skipped (every {eval_interval} epochs)  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([epoch, avg_loss, "", "", "", "", lr_now])
+                primary = None
 
         ckpt = {
             "epoch": epoch, "model_state": model.state_dict(),
@@ -411,7 +428,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
             "args": vars(args),
         }
         torch.save(ckpt, last_ckpt_path)
-        if primary > best_metric:
+        if (primary is not None) and (primary > best_metric):
             best_metric = primary
             best_epoch = epoch
             torch.save(ckpt, best_ckpt_path)
@@ -439,6 +456,8 @@ if __name__ == '__main__':
     parser.add_argument('--freeze-layers', type=bool, default=True,
                         help='Freeze backbone, train neck+head only')
     parser.add_argument('--device',     type=str,   default='cuda:0')
+    parser.add_argument('--eval-interval', type=int, default=10,
+                        help='[detect/segment] Run evaluation every N epochs (last epoch is always evaluated)')
 
     # ---- classify only ----
     parser.add_argument('--data-path',  type=str,   default="Plant_Leaf_Disease",
