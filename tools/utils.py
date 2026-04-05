@@ -379,15 +379,33 @@ def evaluate_detection(model, data_loader, device, ann_file: str):
     if not results_bbox:
         return {"mAP50": 0.0, "mAP50_95": 0.0}
 
+    # with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+    #     json.dump(results_bbox, f)
+    #     tmp_path = f.name
+
+    # coco_dt   = coco_gt.loadRes(tmp_path)
+    # coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    # coco_eval.evaluate()
+    # coco_eval.accumulate()
+    # coco_eval.summarize()
+
+    # return {
+    #     "mAP50":    float(coco_eval.stats[1]),
+    #     "mAP50_95": float(coco_eval.stats[0]),
+    # }
+    # 修改后
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(results_bbox, f)
         tmp_path = f.name
 
-    coco_dt   = coco_gt.loadRes(tmp_path)
-    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
+    try:
+        coco_dt   = coco_gt.loadRes(tmp_path)
+        coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        coco_eval.summarize()
+    finally:
+        os.unlink(tmp_path)
 
     return {
         "mAP50":    float(coco_eval.stats[1]),
@@ -440,25 +458,31 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str):
         return {"box_mAP50": 0.0, "box_mAP50_95": 0.0,
                 "mask_mAP50": 0.0, "mask_mAP50_95": 0.0}
 
+    coco_gt = COCO(ann_file)
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(results_bbox, f)
         tmp_bbox = f.name
-
-    coco_gt   = COCO(ann_file)
-    coco_dt   = coco_gt.loadRes(tmp_bbox)
-    eval_bbox = COCOeval(coco_gt, coco_dt, "bbox")
-    eval_bbox.evaluate(); eval_bbox.accumulate(); eval_bbox.summarize()
+    try:
+        coco_dt   = coco_gt.loadRes(tmp_bbox)
+        eval_bbox = COCOeval(coco_gt, coco_dt, "bbox")
+        eval_bbox.evaluate(); eval_bbox.accumulate(); eval_bbox.summarize()
+    finally:
+        os.unlink(tmp_bbox)
 
     mask_mAP50, mask_mAP50_95 = 0.0, 0.0
     if results_segm:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(results_segm, f)
             tmp_segm = f.name
-        coco_dt   = coco_gt.loadRes(tmp_segm)
-        eval_segm = COCOeval(coco_gt, coco_dt, "segm")
-        eval_segm.evaluate(); eval_segm.accumulate(); eval_segm.summarize()
-        mask_mAP50    = float(eval_segm.stats[1])
-        mask_mAP50_95 = float(eval_segm.stats[0])
+        try:
+            coco_dt   = coco_gt.loadRes(tmp_segm)
+            eval_segm = COCOeval(coco_gt, coco_dt, "segm")
+            eval_segm.evaluate(); eval_segm.accumulate(); eval_segm.summarize()
+            mask_mAP50    = float(eval_segm.stats[1])
+            mask_mAP50_95 = float(eval_segm.stats[0])
+        finally:
+            os.unlink(tmp_segm)
 
     return {
         "box_mAP50":     float(eval_bbox.stats[1]),

@@ -334,9 +334,13 @@ def draw_masks(img: Image.Image, boxes, labels, scores, masks, class_map=None) -
         # mask: [1, H, W] float -> binary numpy
         m = (mask[0] > 0.5).astype(np.uint8)  # [H, W]
         # draw filled mask pixels
-        ys, xs = np.where(m)
-        for y, x in zip(ys.tolist(), xs.tolist()):
-            draw_ov.point((x, y), fill=(r, g, b, 100))
+        # ys, xs = np.where(m)
+        # for y, x in zip(ys.tolist(), xs.tolist()):
+        #     draw_ov.point((x, y), fill=(r, g, b, 100))
+        # 用 PIL 直接从 numpy mask 贴图，速度提升 100x+
+        m_pil = Image.fromarray(m * 255, mode="L")
+        color_layer = Image.new("RGBA", img.size, (r, g, b, 100))
+        overlay.paste(color_layer, mask=m_pil)
 
     img = Image.alpha_composite(img, overlay).convert("RGB")
     # draw boxes on top
@@ -441,7 +445,10 @@ if __name__ == "__main__":
     parser.add_argument("--weights",    type=str, default="run/train/exp16/weights/best.pth")
     parser.add_argument("--model-name", type=str, default="vit_base_patch16_224_in21k")
     parser.add_argument("--device",     type=str, default="cuda:0")
-    parser.add_argument("--draw",       action="store_true", default=True)
+    # parser.add_argument("--draw",       action="store_true", default=True)
+    # 如果想默认开启 draw，改用 BooleanOptionalAction（Python 3.9+）
+    parser.add_argument("--draw", action=argparse.BooleanOptionalAction, default=True)
+    # 用户可以用 --no-draw 来关闭
     parser.add_argument("--num-classes", type=int, default=3,
                         help="Required for detect/segment; optional for classify")
     parser.add_argument("--ann-file", type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json",
