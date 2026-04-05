@@ -457,6 +457,9 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
 
     print(f"Training done. Best metric={best_metric:.4f} at epoch={best_epoch}")
     print(f"Last: {last_ckpt_path}  Best: {best_ckpt_path}")
+    if args.lr > 1e-3:
+        print(f"[WARN] --lr={args.lr} may be too large for AdamW detect/segment. "
+             f"Recommended: 1e-4 ~ 5e-4.")
 
 
 if __name__ == '__main__':
@@ -470,7 +473,7 @@ if __name__ == '__main__':
     # ---- common ----
     parser.add_argument('--epochs',     type=int,   default=100)
     parser.add_argument('--batch-size', type=int,   default=4)
-    parser.add_argument('--lr',         type=float, default=0.001,
+    parser.add_argument('--lr',         type=float, default=1e-4,
                         help='Learning rate. Recommended: 0.001 for classify, 1e-4 for detect/segment')
     parser.add_argument('--lrf',        type=float, default=0.01)
     parser.add_argument('--model',      type=str,   default="vit_base_patch16_224_in21k")
