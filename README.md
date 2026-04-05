@@ -195,3 +195,6 @@ Prediction outputs are saved under `run/predict/expN/predictions.txt`.
 ## Final Reminder
 
 This project is for non-commercial learning use only. Any commercial usage is prohibited.
+
+## some tips
+*This project is not perfect. If you encounter any location errors during use, please raise an issue. Those who are capable can modify it themselves. Submitting a pull request would be even better.*
