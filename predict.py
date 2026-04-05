@@ -16,7 +16,7 @@ import model.vit_model as vit_models
 IMG_SIZE = 224
 MEAN = (0.5, 0.5, 0.5)
 STD  = (0.5, 0.5, 0.5)
-CONF_THRESH = 0.7
+CONF_THRESH = 0.9
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp",
             ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
 

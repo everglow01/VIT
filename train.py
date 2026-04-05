@@ -199,7 +199,29 @@ def build_model_and_prepare(args, device, num_classes: int):
 
 
 def main(args):
-    # 设备选择：优先使用 args.device（例如 cuda:0），若无 GPU 则回退到 CPU
+    # --- 参数校验 ---
+    if args.task == "classify":
+        if not args.data_path:
+            raise ValueError("--data-path is required for --task classify")
+        if not os.path.isdir(args.data_path):
+            raise FileNotFoundError(f"data-path not found: {args.data_path}")
+    if args.task in ("detect", "segment"):
+        required = {
+            "--train-img-dir":  args.train_img_dir,
+            "--train-ann-file": args.train_ann_file,
+            "--val-img-dir":    args.val_img_dir,
+            "--val-ann-file":   args.val_ann_file,
+        }
+        for name, val in required.items():
+            if not val:
+                raise ValueError(f"{name} is required for --task {args.task}")
+            if name.endswith("-dir") and not os.path.isdir(val):
+                raise FileNotFoundError(f"{name} directory not found: {val}")
+            if name.endswith("-file") and not os.path.isfile(val):
+                raise FileNotFoundError(f"{name} file not found: {val}")
+    if args.weights and not os.path.isfile(args.weights):
+        raise FileNotFoundError(f"--weights file not found: {args.weights}")
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # 调用函数获取新的exp文件夹和weights文件夹路径
@@ -330,7 +352,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     model.to(device)
 
     pg = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
+    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
     lf = lambda x: ((1 + math.cos(x * math.pi / args.epochs)) / 2) * (1 - args.lrf) + args.lrf
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
@@ -393,7 +415,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         if task == "detect":
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running detection evaluation...")
-                metrics = evaluate_detection(model, val_loader, device)
+                metrics = evaluate_detection(model, val_loader, device, ann_file=args.val_ann_file)
                 map50    = metrics["mAP50"]
                 map50_95 = metrics["mAP50_95"]
                 print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  mAP50={map50:.4f}  mAP50-95={map50_95:.4f}  lr={lr_now:.6f}")
@@ -408,7 +430,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         else:
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running segmentation evaluation...")
-                metrics = evaluate_segmentation(model, val_loader, device)
+                metrics = evaluate_segmentation(model, val_loader, device, ann_file=args.val_ann_file)
                 print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
                       f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
                 with open(metrics_path, "a", newline="") as f:
@@ -448,13 +470,14 @@ if __name__ == '__main__':
     # ---- common ----
     parser.add_argument('--epochs',     type=int,   default=100)
     parser.add_argument('--batch-size', type=int,   default=4)
-    parser.add_argument('--lr',         type=float, default=0.001)
+    parser.add_argument('--lr',         type=float, default=0.001,
+                        help='Learning rate. Recommended: 0.001 for classify, 1e-4 for detect/segment')
     parser.add_argument('--lrf',        type=float, default=0.01)
     parser.add_argument('--model',      type=str,   default="vit_base_patch16_224_in21k")
     parser.add_argument('--weights',    type=str,   default='weights/jx_vit_base_patch16_224_in21k-e5005f0a.pth',
                         help='Pretrained backbone weights path; pass empty string to skip')
-    parser.add_argument('--freeze-layers', type=bool, default=True,
-                        help='Freeze backbone, train neck+head only')
+    parser.add_argument('--freeze-layers', type=lambda x: x.lower() == 'true', default=True,
+                        help='Freeze backbone layers. Pass True or False. Example: --freeze-layers False')
     parser.add_argument('--device',     type=str,   default='cuda:0')
     parser.add_argument('--eval-interval', type=int, default=10,
                         help='[detect/segment] Run evaluation every N epochs (last epoch is always evaluated)')

@@ -336,220 +336,133 @@ def evaluate(model, data_loader, device, epoch, epochs, num_classes: int, indent
 
 
 # ============================================================
-# Detection / Segmentation evaluation utilities
+# Detection / Segmentation evaluation (pycocotools standard)
 # ============================================================
 
+import json
+import tempfile
 import numpy as np
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from pycocotools import mask as maskUtils
 
 
-def box_iou_numpy(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
-    """Compute IoU between two sets of boxes [N,4] and [M,4] -> [N,M]."""
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-
-    inter_x1 = np.maximum(boxes1[:, None, 0], boxes2[None, :, 0])
-    inter_y1 = np.maximum(boxes1[:, None, 1], boxes2[None, :, 1])
-    inter_x2 = np.minimum(boxes1[:, None, 2], boxes2[None, :, 2])
-    inter_y2 = np.minimum(boxes1[:, None, 3], boxes2[None, :, 3])
-
-    inter = np.maximum(inter_x2 - inter_x1, 0) * np.maximum(inter_y2 - inter_y1, 0)
-    union = area1[:, None] + area2[None, :] - inter
-    return inter / np.maximum(union, 1e-12)
-
-
-def mask_iou_numpy(mask1: np.ndarray, mask2: np.ndarray) -> float:
-    """IoU between two binary masks [H,W]."""
-    inter = (mask1 & mask2).sum()
-    union = (mask1 | mask2).sum()
-    return inter / max(union, 1)
-
-
-def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
-    """101-point COCO interpolation AP."""
-    x = np.linspace(0, 1, 101)
-    ap = np.trapz(np.interp(x, recall, precision), x)
-    return float(ap)
-
-
-def ap_per_class(
-    tp: np.ndarray,       # [D] bool, sorted by confidence desc
-    conf: np.ndarray,     # [D] confidence scores
-    pred_cls: np.ndarray, # [D] predicted class ids
-    gt_cls: np.ndarray,   # [G] ground-truth class ids
-) -> dict:
+def evaluate_detection(model, data_loader, device, ann_file: str):
     """
-    Compute AP per class from matched detections.
-    Returns dict: {class_id: ap}
-    """
-    unique_classes = np.unique(gt_cls)
-    ap_dict = {}
-    for c in unique_classes:
-        mask = pred_cls == c
-        n_gt = (gt_cls == c).sum()
-        if n_gt == 0:
-            continue
-        if mask.sum() == 0:
-            ap_dict[int(c)] = 0.0
-            continue
-
-        tp_c = tp[mask].astype(float)
-        conf_c = conf[mask]
-        order = np.argsort(-conf_c)
-        tp_c = tp_c[order]
-
-        cum_tp = np.cumsum(tp_c)
-        cum_fp = np.cumsum(1 - tp_c)
-        precision = cum_tp / (cum_tp + cum_fp + 1e-12)
-        recall = cum_tp / (n_gt + 1e-12)
-
-        # prepend (0,1) for proper curve
-        precision = np.concatenate([[1.0], precision])
-        recall = np.concatenate([[0.0], recall])
-        ap_dict[int(c)] = compute_ap(recall, precision)
-
-    return ap_dict
-
-
-@torch.no_grad()
-def evaluate_detection(model, data_loader, device, iou_thresh: float = 0.5):
-    """
-    Evaluate Faster R-CNN style model on COCO-format val loader.
-    Returns dict: {mAP50, mAP50_95, per_class_ap}
+    Standard COCO detection evaluation using pycocotools.
+    Returns dict: {mAP50, mAP50_95}
     """
     model.eval()
-    all_tp, all_conf, all_pred_cls, all_gt_cls = [], [], [], []
+    coco_gt = COCO(ann_file)
+    results_bbox = []
 
-    iou_thresholds = np.linspace(0.5, 0.95, 10)
-
-    pbar = tqdm(data_loader, file=sys.stdout, dynamic_ncols=True,
-                desc="detect-eval", leave=True)
-
-    for images, targets in pbar:
+    for images, targets in tqdm(data_loader, desc="det-eval", file=sys.stdout, leave=True):
         images = [img.to(device) for img in images]
-        outputs = model(images)
+        with torch.no_grad():
+            outputs = model(images)
 
         for out, tgt in zip(outputs, targets):
-            gt_boxes  = tgt["boxes"].numpy()
-            gt_labels = tgt["labels"].numpy()
+            image_id    = int(tgt["image_id"])
             pred_boxes  = out["boxes"].cpu().numpy()
             pred_scores = out["scores"].cpu().numpy()
             pred_labels = out["labels"].cpu().numpy()
 
-            if len(pred_boxes) == 0:
-                all_gt_cls.extend(gt_labels.tolist())
-                continue
+            for i in range(len(pred_boxes)):
+                x1, y1, x2, y2 = pred_boxes[i]
+                results_bbox.append({
+                    "image_id":    image_id,
+                    "category_id": int(pred_labels[i]),
+                    "bbox":        [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                    "score":       float(pred_scores[i]),
+                })
 
-            # Match at iou_thresh=0.5 for per-class AP
-            if len(gt_boxes) > 0:
-                iou = box_iou_numpy(pred_boxes, gt_boxes)  # [P, G]
-                matched_gt = np.full(len(gt_boxes), False)
-                tp = np.zeros(len(pred_boxes), dtype=bool)
-                for pi in np.argsort(-pred_scores):
-                    gi = np.argmax(iou[pi])
-                    if iou[pi, gi] >= iou_thresh and not matched_gt[gi] and pred_labels[pi] == gt_labels[gi]:
-                        tp[pi] = True
-                        matched_gt[gi] = True
-            else:
-                tp = np.zeros(len(pred_boxes), dtype=bool)
+    if not results_bbox:
+        return {"mAP50": 0.0, "mAP50_95": 0.0}
 
-            all_tp.extend(tp.tolist())
-            all_conf.extend(pred_scores.tolist())
-            all_pred_cls.extend(pred_labels.tolist())
-            all_gt_cls.extend(gt_labels.tolist())
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(results_bbox, f)
+        tmp_path = f.name
 
-    if not all_gt_cls:
-        return {"mAP50": 0.0, "mAP50_95": 0.0, "per_class_ap": {}}
+    coco_dt   = coco_gt.loadRes(tmp_path)
+    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
 
-    tp_arr   = np.array(all_tp,       dtype=bool)
-    conf_arr = np.array(all_conf,     dtype=float)
-    pred_arr = np.array(all_pred_cls, dtype=int)
-    gt_arr   = np.array(all_gt_cls,   dtype=int)
-
-    ap50 = ap_per_class(tp_arr, conf_arr, pred_arr, gt_arr)
-    map50 = float(np.mean(list(ap50.values()))) if ap50 else 0.0
-
-    # mAP50-95: average over 10 IoU thresholds
-    maps = []
-    for thr in iou_thresholds:
-        ap_t = ap_per_class(tp_arr, conf_arr, pred_arr, gt_arr)
-        maps.append(float(np.mean(list(ap_t.values()))) if ap_t else 0.0)
-    map50_95 = float(np.mean(maps))
-
-    return {"mAP50": map50, "mAP50_95": map50_95, "per_class_ap": ap50}
+    return {
+        "mAP50":    float(coco_eval.stats[1]),
+        "mAP50_95": float(coco_eval.stats[0]),
+    }
 
 
-@torch.no_grad()
-def evaluate_segmentation(model, data_loader, device, iou_thresh: float = 0.5):
+def evaluate_segmentation(model, data_loader, device, ann_file: str):
     """
-    Evaluate Mask R-CNN style model.
+    Standard COCO instance segmentation evaluation using pycocotools.
     Returns dict: {box_mAP50, box_mAP50_95, mask_mAP50, mask_mAP50_95}
     """
     model.eval()
-    box_tp, box_conf, box_pred_cls, box_gt_cls = [], [], [], []
-    mask_tp = []
+    results_bbox = []
+    results_segm = []
 
-    pbar = tqdm(data_loader, file=sys.stdout, dynamic_ncols=True,
-                desc="segment-eval", leave=True)
-
-    for images, targets in pbar:
+    for images, targets in tqdm(data_loader, desc="seg-eval", file=sys.stdout, leave=True):
         images = [img.to(device) for img in images]
-        outputs = model(images)
+        with torch.no_grad():
+            outputs = model(images)
 
         for out, tgt in zip(outputs, targets):
-            gt_boxes  = tgt["boxes"].numpy()
-            gt_labels = tgt["labels"].numpy()
-            gt_masks  = tgt.get("masks", None)
+            image_id    = int(tgt["image_id"])
             pred_boxes  = out["boxes"].cpu().numpy()
             pred_scores = out["scores"].cpu().numpy()
             pred_labels = out["labels"].cpu().numpy()
             pred_masks  = out.get("masks", None)  # [N, 1, H, W] float
 
-            if len(pred_boxes) == 0:
-                box_gt_cls.extend(gt_labels.tolist())
-                continue
+            for i in range(len(pred_boxes)):
+                x1, y1, x2, y2 = pred_boxes[i]
+                results_bbox.append({
+                    "image_id":    image_id,
+                    "category_id": int(pred_labels[i]),
+                    "bbox":        [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                    "score":       float(pred_scores[i]),
+                })
 
-            if len(gt_boxes) > 0:
-                iou = box_iou_numpy(pred_boxes, gt_boxes)
-                matched_gt = np.full(len(gt_boxes), False)
-                tp_box  = np.zeros(len(pred_boxes), dtype=bool)
-                tp_mask = np.zeros(len(pred_boxes), dtype=bool)
+                if pred_masks is not None:
+                    mask = (pred_masks[i, 0].cpu().numpy() > 0.5).astype(np.uint8)
+                    rle  = maskUtils.encode(np.asfortranarray(mask))
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    results_segm.append({
+                        "image_id":     image_id,
+                        "category_id":  int(pred_labels[i]),
+                        "segmentation": rle,
+                        "score":        float(pred_scores[i]),
+                    })
 
-                for pi in np.argsort(-pred_scores):
-                    gi = np.argmax(iou[pi])
-                    if iou[pi, gi] >= iou_thresh and not matched_gt[gi] and pred_labels[pi] == gt_labels[gi]:
-                        tp_box[pi] = True
-                        matched_gt[gi] = True
-                        # mask IoU
-                        if pred_masks is not None and gt_masks is not None:
-                            pm = (pred_masks[pi, 0].cpu().numpy() > 0.5).astype(np.uint8)
-                            gm = gt_masks[gi].numpy().astype(np.uint8)
-                            if mask_iou_numpy(pm, gm) >= iou_thresh:
-                                tp_mask[pi] = True
-            else:
-                tp_box  = np.zeros(len(pred_boxes), dtype=bool)
-                tp_mask = np.zeros(len(pred_boxes), dtype=bool)
+    if not results_bbox:
+        return {"box_mAP50": 0.0, "box_mAP50_95": 0.0,
+                "mask_mAP50": 0.0, "mask_mAP50_95": 0.0}
 
-            box_tp.extend(tp_box.tolist())
-            mask_tp.extend(tp_mask.tolist())
-            box_conf.extend(pred_scores.tolist())
-            box_pred_cls.extend(pred_labels.tolist())
-            box_gt_cls.extend(gt_labels.tolist())
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(results_bbox, f)
+        tmp_bbox = f.name
 
-    if not box_gt_cls:
-        return {"box_mAP50": 0.0, "box_mAP50_95": 0.0, "mask_mAP50": 0.0, "mask_mAP50_95": 0.0}
+    coco_gt   = COCO(ann_file)
+    coco_dt   = coco_gt.loadRes(tmp_bbox)
+    eval_bbox = COCOeval(coco_gt, coco_dt, "bbox")
+    eval_bbox.evaluate(); eval_bbox.accumulate(); eval_bbox.summarize()
 
-    conf_arr     = np.array(box_conf,     dtype=float)
-    pred_arr     = np.array(box_pred_cls, dtype=int)
-    gt_arr       = np.array(box_gt_cls,   dtype=int)
-    box_tp_arr   = np.array(box_tp,       dtype=bool)
-    mask_tp_arr  = np.array(mask_tp,      dtype=bool)
-
-    box_ap50  = ap_per_class(box_tp_arr,  conf_arr, pred_arr, gt_arr)
-    mask_ap50 = ap_per_class(mask_tp_arr, conf_arr, pred_arr, gt_arr)
+    mask_mAP50, mask_mAP50_95 = 0.0, 0.0
+    if results_segm:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(results_segm, f)
+            tmp_segm = f.name
+        coco_dt   = coco_gt.loadRes(tmp_segm)
+        eval_segm = COCOeval(coco_gt, coco_dt, "segm")
+        eval_segm.evaluate(); eval_segm.accumulate(); eval_segm.summarize()
+        mask_mAP50    = float(eval_segm.stats[1])
+        mask_mAP50_95 = float(eval_segm.stats[0])
 
     return {
-        "box_mAP50":    float(np.mean(list(box_ap50.values())))  if box_ap50  else 0.0,
-        "box_mAP50_95": float(np.mean(list(box_ap50.values())))  if box_ap50  else 0.0,
-        "mask_mAP50":   float(np.mean(list(mask_ap50.values()))) if mask_ap50 else 0.0,
-        "mask_mAP50_95":float(np.mean(list(mask_ap50.values()))) if mask_ap50 else 0.0,
+        "box_mAP50":     float(eval_bbox.stats[1]),
+        "box_mAP50_95":  float(eval_bbox.stats[0]),
+        "mask_mAP50":    mask_mAP50,
+        "mask_mAP50_95": mask_mAP50_95,
     }
