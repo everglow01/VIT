@@ -184,16 +184,17 @@ path/to/img1.jpg\tstem\t0.9321\t120.6\t88.4\t232.5\t210.3
 
 > Tip: If your GPU memory is limited, lower `--batch-size` first and keep `--eval-interval` larger for smoother training.
 
-### 💡 tips
-1.For datasets with small amounts of data or small GPUs, it is recommended to freeze the backbone and use a pre-trained backbone.  
+### 💡 Tips
 
-2.This model has high VRAM requirements. The default batch size may result in a "CUDA is out of memory" error. At least 8GB of VRAM is required, and batch sizes of 2-4 are recommended.  
+- **Freeze the backbone first.** Unless you have a large dataset, keep `--freeze-layers True` and only fine-tune the head. It trains faster and avoids overfitting on small data.
 
-3.The default evaluation method produces the same results when processing mAP50 and mAP50_90. If you need to switch to the native COCO dataset evaluation mode, you will need to manually modify the settings.(The issue has been fixed; all calculations have now been changed to conform to the COCO standard for mAP calculation.)  
+- **VRAM is the main bottleneck.** ViT is memory-hungry. If you hit OOM, drop `--batch-size` to 2–4 first. Detection/segmentation needs at least 8 GB; classification is more forgiving.
 
-4.The evaluation mode defaults to evaluating every ten rounds (or the last round). This was modified on my computer to reduce the reasoning burden. If needed, you can change the default to evaluating every round.  
+- **Evaluation runs on the last epoch (and every `--eval-interval` epochs).** The default interval is 10 to keep training fast. Set `--eval-interval 1` if you want per-epoch mAP, but expect slower runs.
 
-5.The default label names come from your COCO dataset's JSON file. If the label names are incorrect, please check if your JSON file format and content are correct.   
+- **mAP follows the COCO standard.** Both mAP@0.5 and mAP@0.5:0.95 are computed with pycocotools, so numbers are directly comparable to other COCO benchmarks.
+
+- **Class names come from your COCO JSON.** If labels look wrong in outputs or charts, check the `categories` field in your annotation file.
 
 
 
