@@ -30,21 +30,25 @@ By using this repository, you agree to these restrictions.
 
 ## 🧭 Overview
 
-This project is a Vision Transformer (ViT)-based computer vision learning project with three supported tasks:
-- Image classification 
-- Object detection (COCO format)
-- Instance segmentation (COCO format)
+This project brings Vision Transformer (ViT) into three classic computer vision tasks — image classification, object detection, and instance segmentation — all under one unified training and inference entry point.
 
-It supports transfer learning from ImageNet-21k pretrained ViT weights and includes training, evaluation, inference, and visualization utilities.
+The backbone is a pretrained ViT (ImageNet-21k), extended with an FPN neck and task-specific heads: a Fast R-CNN style head for detection, and a Mask R-CNN style mask branch on top for segmentation. Transfer learning is the default workflow — freeze the backbone, fine-tune the head, and get results fast even on limited hardware.
+
+Beyond training, the project puts some effort into making results actually readable: COCO-standard mAP evaluation, per-class AP charts, PR curves, F1-confidence curves, confusion matrices with background, calibration curves, and scale/mask analysis are all generated automatically at the end of training. No extra scripts needed.
 
 ## ✨ Key Features
 
-- Multiple ViT backbones (base / large / huge)
-- Classification metrics (loss, accuracy, macro precision/recall/F1)
-- Detection and segmentation training pipeline
+- Multiple ViT backbones (base / large / huge, patch 14/16/32)
+- Three tasks in one entry point: classification, detection, segmentation
+- Detection via ViT + FPN neck + Fast R-CNN head; segmentation adds Mask R-CNN style mask branch
+- COCO-format training and evaluation with pycocotools mAP (mAP@0.5, mAP@0.5:0.95)
+- Classification metrics: loss, accuracy, macro precision / recall / F1 per epoch
+- Rich post-training evaluation charts for detection/segmentation:
+  - PR curves, F1-Confidence curve, per-class AP bar chart
+  - Confusion matrix (with background class), calibration curve
+  - Scale analysis (small / medium / large), mask IoU analysis (segmentation)
 - Auto-increment experiment folders (`run/train/expN`)
-- Metric plotting and confusion matrix generation
-- Prediction export for inference runs
+- Inference with optional visualization (`--draw`) and TSV prediction export
 ### 🔍 About Detection
 The traditional VIT backbone was used, a YOLO-like FPN neck was added, and finally, a torch-style Fast R-CNN was used for the final regression and classification.
 
@@ -298,7 +302,9 @@ python predict.py \
 
 ## 📁 Outputs
 
-Training outputs are saved under `run/train/expN/`, including:
+Training outputs are saved under `run/train/expN/`,   
+
+classify including:
 - `weights/best.pth`
 - `weights/last.pth`
 - `metrics.csv`
@@ -308,7 +314,19 @@ Training outputs are saved under `run/train/expN/`, including:
 - `val_prf_curve.png`
 - `confusion_matrix.png`
 
-Prediction outputs are saved under `run/predict/expN/predictions.txt`.
+Prediction outputs are saved under `run/predict/expN/predictions.txt`.  
+
+Detection/segmentation including:  
+- `weights/best.pth`
+- `weights/last.pth`
+- `metrics.csv`
+- `calibration_curve.png`
+- `confusion_matrix.png`
+- `f1_confidence.png`
+- `mask_analysis`
+- `per_class_ap.png`
+- `pr_curve.png`
+- `scale_analysis.png`(Segmentation unique)
 
 
 
