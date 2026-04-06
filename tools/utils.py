@@ -347,10 +347,257 @@ from pycocotools.cocoeval import COCOeval
 from pycocotools import mask as maskUtils
 
 
-def evaluate_detection(model, data_loader, device, ann_file: str):
+def _get_class_names(coco_gt) -> dict:
+    """Return {cat_id: name} from COCO object."""
+    return {cat["id"]: cat["name"] for cat in coco_gt.dataset.get("categories", [])}
+
+
+def _plot_pr_curves(coco_eval, save_dir: str, iou_idx: int = 0):
+    """PR curves per class at IoU=0.5 (iou_idx=0)."""
+    import matplotlib.pyplot as plt
+    prec = coco_eval.eval["precision"]   # [T, R, K, A, M]
+    cat_ids = coco_eval.params.catIds
+    class_names = _get_class_names(coco_eval.cocoGt)
+    recall_pts = np.linspace(0, 1, prec.shape[1])
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for ki, cat_id in enumerate(cat_ids):
+        p = prec[iou_idx, :, ki, 0, 2]
+        valid = p >= 0
+        if not valid.any():
+            continue
+        label = class_names.get(cat_id, str(cat_id))
+        ax.plot(recall_pts[valid], p[valid], linewidth=1, label=label)
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("PR Curve (IoU=0.5)")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    if len(cat_ids) <= 20:
+        ax.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "pr_curve.png"), dpi=150)
+    plt.close(fig)
+
+
+def _plot_f1_confidence(coco_eval, save_dir: str):
+    """F1-Confidence curve built from evalImgs (area='all', maxDet=last)."""
+    import matplotlib.pyplot as plt
+    cat_ids = coco_eval.params.catIds
+    class_names = _get_class_names(coco_eval.cocoGt)
+
+    area_idx = next(i for i, lbl in enumerate(coco_eval.params.areaRngLbl) if lbl == "all")
+    n_area = len(coco_eval.params.areaRng)
+    n_imgs = len(coco_eval.params.imgIds)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for ki, cat_id in enumerate(cat_ids):
+        scores, tps, n_gt = [], [], 0
+        for img_idx in range(n_imgs):
+            e = coco_eval.evalImgs[ki * n_area * n_imgs + area_idx * n_imgs + img_idx]
+            if e is None:
+                continue
+            dt_matches = e["dtMatches"][0]
+            dt_scores  = e["dtScores"]
+            dt_ignore  = e["dtIgnore"][0]
+            for sc, m, ig in zip(dt_scores, dt_matches, dt_ignore):
+                if ig:
+                    continue
+                scores.append(sc)
+                tps.append(1 if m > 0 else 0)
+            n_gt += len(e["gtIds"]) - int(sum(e["gtIgnore"]))
+
+        if not scores:
+            continue
+        order = np.argsort(-np.array(scores))
+        tps_s = np.array(tps)[order]
+        cum_tp = np.cumsum(tps_s)
+        cum_fp = np.cumsum(1 - tps_s)
+        prec = cum_tp / (cum_tp + cum_fp + 1e-12)
+        rec  = cum_tp / (n_gt + 1e-12)
+        f1   = 2 * prec * rec / (prec + rec + 1e-12)
+        conf = np.array(scores)[order]
+        ax.plot(conf, f1, linewidth=1, label=class_names.get(cat_id, str(cat_id)))
+
+    ax.set_xlabel("Confidence")
+    ax.set_ylabel("F1")
+    ax.set_title("F1-Confidence Curve")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    if len(cat_ids) <= 20:
+        ax.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "f1_confidence.png"), dpi=150)
+    plt.close(fig)
+
+
+def _plot_confusion_matrix(coco_gt, coco_eval, save_dir: str, iou_thr: float = 0.5):
+    """Confusion matrix including background row/col (area='all', maxDet=last)."""
+    import matplotlib.pyplot as plt
+    cat_ids = sorted(coco_gt.getCatIds())
+    class_names = _get_class_names(coco_gt)
+    n = len(cat_ids)
+    cat_to_idx = {c: i for i, c in enumerate(cat_ids)}
+    cm = np.zeros((n + 1, n + 1), dtype=np.int64)
+
+    iou_thr_idx = int(np.argmin(np.abs(np.array(coco_eval.params.iouThrs) - iou_thr)))
+    area_idx = next(i for i, lbl in enumerate(coco_eval.params.areaRngLbl) if lbl == "all")
+    cat_ids_eval = coco_eval.params.catIds
+    n_area = len(coco_eval.params.areaRng)
+    n_imgs = len(coco_eval.params.imgIds)
+
+    for ki, cat_id in enumerate(cat_ids_eval):
+        pred_idx = cat_to_idx.get(cat_id, n)
+        gt_idx   = cat_to_idx.get(cat_id, n)
+        for img_idx in range(n_imgs):
+            e = coco_eval.evalImgs[ki * n_area * n_imgs + area_idx * n_imgs + img_idx]
+            if e is None:
+                continue
+            for gm, gig in zip(e["gtMatches"][iou_thr_idx], e["gtIgnore"]):
+                if gig:
+                    continue
+                if gm > 0:
+                    cm[gt_idx, pred_idx] += 1
+                else:
+                    cm[gt_idx, n] += 1
+            for dm, di in zip(e["dtMatches"][iou_thr_idx], e["dtIgnore"][iou_thr_idx]):
+                if di:
+                    continue
+                if dm == 0:
+                    cm[n, pred_idx] += 1
+
+    labels = [class_names.get(c, str(c)) for c in cat_ids] + ["background"]
+    fig, ax = plt.subplots(figsize=(max(8, n + 2), max(6, n + 1)))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(range(n + 1)); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_yticks(range(n + 1)); ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("Ground Truth")
+    ax.set_title(f"Confusion Matrix (IoU≥{iou_thr})")
+    for i in range(n + 1):
+        for j in range(n + 1):
+            if cm[i, j] > 0:
+                ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                        fontsize=6, color="white" if cm[i, j] > cm.max() * 0.5 else "black")
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+
+def _plot_per_class_ap(coco_eval, save_dir: str, iou_idx: int = 0):
+    """Bar chart of per-class AP@0.5 with mean reference line."""
+    import matplotlib.pyplot as plt
+    prec = coco_eval.eval["precision"]   # [T, R, K, A, M]
+    cat_ids = coco_eval.params.catIds
+    class_names = _get_class_names(coco_eval.cocoGt)
+
+    aps, names = [], []
+    for ki, cat_id in enumerate(cat_ids):
+        p = prec[iou_idx, :, ki, 0, 2]
+        aps.append(np.mean(p[p >= 0]) if (p >= 0).any() else 0.0)
+        names.append(class_names.get(cat_id, str(cat_id)))
+
+    fig, ax = plt.subplots(figsize=(max(8, len(names) * 0.5), 5))
+    x = np.arange(len(names))
+    ax.bar(x, aps, color="steelblue")
+    mean_ap = float(np.mean(aps))
+    ax.axhline(y=mean_ap, color="red", linestyle="--", linewidth=1.2, label=f"mAP = {mean_ap:.3f}")
+    ax.legend(fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+    ax.set_ylim(0, 1); ax.set_ylabel("AP@0.5")
+    ax.set_title("Per-Class AP@0.5")
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "per_class_ap.png"), dpi=150)
+    plt.close(fig)
+
+
+def _plot_scale_analysis(coco_eval, save_dir: str):
+    """Bar chart: mAP@0.5:0.95 for all / small / medium / large objects."""
+    import matplotlib.pyplot as plt
+    stats = coco_eval.stats
+    labels = ["All", "Small", "Medium", "Large"]
+    vals   = [stats[0], stats[3], stats[4], stats[5]]   # all mAP@0.5:0.95
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.bar(labels, vals, color=["steelblue", "salmon", "orange", "mediumseagreen"])
+    ax.set_ylim(0, 1); ax.set_ylabel("mAP@0.5:0.95")
+    ax.set_title("Scale Analysis (mAP@0.5:0.95)")
+    for i, v in enumerate(vals):
+        ax.text(i, v + 0.01, f"{v:.3f}", ha="center", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "scale_analysis.png"), dpi=150)
+    plt.close(fig)
+
+
+def _plot_calibration_curve(coco_eval, save_dir: str, n_bins: int = 10):
+    """Reliability diagram: mean confidence vs fraction of positives."""
+    import matplotlib.pyplot as plt
+    scores, tps = [], []
+    for img_eval in coco_eval.evalImgs:
+        if img_eval is None:
+            continue
+        dt_matches = img_eval["dtMatches"][0]
+        dt_scores  = img_eval["dtScores"]
+        dt_ignore  = img_eval["dtIgnore"][0]
+        for sc, m, ig in zip(dt_scores, dt_matches, dt_ignore):
+            if ig:
+                continue
+            scores.append(sc)
+            tps.append(1 if m > 0 else 0)
+
+    if not scores:
+        return
+    scores = np.array(scores)
+    tps    = np.array(tps)
+    bins   = np.linspace(0, 1, n_bins + 1)
+    mean_conf, frac_pos = [], []
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (scores >= lo) & (scores < hi)
+        if mask.sum() == 0:
+            continue
+        mean_conf.append(scores[mask].mean())
+        frac_pos.append(tps[mask].mean())
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Perfect calibration")
+    ax.plot(mean_conf, frac_pos, "o-", color="steelblue", label="Model")
+    ax.set_xlabel("Mean Confidence"); ax.set_ylabel("Fraction of Positives")
+    ax.set_title("Calibration Curve"); ax.legend()
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "calibration_curve.png"), dpi=150)
+    plt.close(fig)
+
+
+def _plot_mask_analysis(coco_eval_bbox, coco_eval_segm, save_dir: str):
+    """Compare bbox AP vs mask AP per class."""
+    import matplotlib.pyplot as plt
+    cat_ids = coco_eval_bbox.params.catIds
+    class_names = _get_class_names(coco_eval_bbox.cocoGt)
+
+    box_aps, mask_aps, names = [], [], []
+    for ki, cat_id in enumerate(cat_ids):
+        pb = coco_eval_bbox.eval["precision"][0, :, ki, 0, 2]
+        pm = coco_eval_segm.eval["precision"][0, :, ki, 0, 2]
+        box_aps.append(np.mean(pb[pb >= 0]) if (pb >= 0).any() else 0.0)
+        mask_aps.append(np.mean(pm[pm >= 0]) if (pm >= 0).any() else 0.0)
+        names.append(class_names.get(cat_id, str(cat_id)))
+
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(max(8, len(names) * 0.6), 5))
+    ax.bar(x - 0.2, box_aps,  0.4, label="Box AP@0.5",  color="steelblue")
+    ax.bar(x + 0.2, mask_aps, 0.4, label="Mask AP@0.5", color="salmon")
+    ax.set_xticks(x); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+    ax.set_ylim(0, 1); ax.set_ylabel("AP@0.5")
+    ax.set_title("Mask vs Box AP per Class"); ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "mask_analysis.png"), dpi=150)
+    plt.close(fig)
+
+
+def evaluate_detection(model, data_loader, device, ann_file: str, save_dir: Optional[str] = None):
     """
     Standard COCO detection evaluation using pycocotools.
     Returns dict: {mAP50, mAP50_95}
+    If save_dir is provided, saves PR curve, F1-confidence, confusion matrix,
+    per-class AP, scale analysis, and calibration curve plots there.
     """
     model.eval()
     coco_gt = COCO(ann_file)
@@ -379,21 +626,6 @@ def evaluate_detection(model, data_loader, device, ann_file: str):
     if not results_bbox:
         return {"mAP50": 0.0, "mAP50_95": 0.0}
 
-    # with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-    #     json.dump(results_bbox, f)
-    #     tmp_path = f.name
-
-    # coco_dt   = coco_gt.loadRes(tmp_path)
-    # coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
-    # coco_eval.evaluate()
-    # coco_eval.accumulate()
-    # coco_eval.summarize()
-
-    # return {
-    #     "mAP50":    float(coco_eval.stats[1]),
-    #     "mAP50_95": float(coco_eval.stats[0]),
-    # }
-    # 修改后
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(results_bbox, f)
         tmp_path = f.name
@@ -407,16 +639,26 @@ def evaluate_detection(model, data_loader, device, ann_file: str):
     finally:
         os.unlink(tmp_path)
 
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        _plot_pr_curves(coco_eval, save_dir)
+        _plot_f1_confidence(coco_eval, save_dir)
+        _plot_confusion_matrix(coco_gt, coco_eval, save_dir)
+        _plot_per_class_ap(coco_eval, save_dir)
+        _plot_scale_analysis(coco_eval, save_dir)
+        _plot_calibration_curve(coco_eval, save_dir)
+
     return {
         "mAP50":    float(coco_eval.stats[1]),
         "mAP50_95": float(coco_eval.stats[0]),
     }
 
 
-def evaluate_segmentation(model, data_loader, device, ann_file: str):
+def evaluate_segmentation(model, data_loader, device, ann_file: str, save_dir: Optional[str] = None):
     """
     Standard COCO instance segmentation evaluation using pycocotools.
     Returns dict: {box_mAP50, box_mAP50_95, mask_mAP50, mask_mAP50_95}
+    If save_dir is provided, saves all detection plots plus mask_analysis.png.
     """
     model.eval()
     results_bbox = []
@@ -470,6 +712,7 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str):
     finally:
         os.unlink(tmp_bbox)
 
+    eval_segm = None
     mask_mAP50, mask_mAP50_95 = 0.0, 0.0
     if results_segm:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -483,6 +726,17 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str):
             mask_mAP50_95 = float(eval_segm.stats[0])
         finally:
             os.unlink(tmp_segm)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        _plot_pr_curves(eval_bbox, save_dir)
+        _plot_f1_confidence(eval_bbox, save_dir)
+        _plot_confusion_matrix(coco_gt, eval_bbox, save_dir)
+        _plot_per_class_ap(eval_bbox, save_dir)
+        _plot_scale_analysis(eval_bbox, save_dir)
+        _plot_calibration_curve(eval_bbox, save_dir)
+        if eval_segm is not None:
+            _plot_mask_analysis(eval_bbox, eval_segm, save_dir)
 
     return {
         "box_mAP50":     float(eval_bbox.stats[1]),

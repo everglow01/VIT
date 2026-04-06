@@ -415,7 +415,9 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         if task == "detect":
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running detection evaluation...")
-                metrics = evaluate_detection(model, val_loader, device, ann_file=args.val_ann_file)
+                is_last = (epoch + 1) == args.epochs
+                metrics = evaluate_detection(model, val_loader, device, ann_file=args.val_ann_file,
+                                             save_dir=exp_folder if is_last else None)
                 map50    = metrics["mAP50"]
                 map50_95 = metrics["mAP50_95"]
                 print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  mAP50={map50:.4f}  mAP50-95={map50_95:.4f}  lr={lr_now:.6f}")
@@ -430,7 +432,9 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         else:
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running segmentation evaluation...")
-                metrics = evaluate_segmentation(model, val_loader, device, ann_file=args.val_ann_file)
+                is_last = (epoch + 1) == args.epochs
+                metrics = evaluate_segmentation(model, val_loader, device, ann_file=args.val_ann_file,
+                                                save_dir=exp_folder if is_last else None)
                 print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
                       f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
                 with open(metrics_path, "a", newline="") as f:
