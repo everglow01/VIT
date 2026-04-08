@@ -411,8 +411,14 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
             loss_dict = model(images, targets)
             loss = sum(loss_dict.values())
 
+            if not torch.isfinite(loss):
+                print(f"\nWARNING: non-finite loss detected at epoch {epoch+1}, skipping this batch: {loss}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(pg, max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -512,13 +518,13 @@ if __name__ == '__main__':
                         help='[classify] Dataset root directory (ImageFolder style)')
 
     # ---- detect / segment only ----
-    parser.add_argument('--train-img-dir',  type=str, default="data/TOMATO.v5i.coco-segmentation/train",
+    parser.add_argument('--train-img-dir',  type=str, default="data/TOMATO.v7i.coco-segmentation/images/train",
                         help='[detect/segment] Training images directory')
-    parser.add_argument('--train-ann-file', type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_train.coco.json",
+    parser.add_argument('--train-ann-file', type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_train_fixed.json",
                         help='[detect/segment] Training COCO annotation JSON')
-    parser.add_argument('--val-img-dir',    type=str, default="data/TOMATO.v5i.coco-segmentation/valid",
+    parser.add_argument('--val-img-dir',    type=str, default="data/TOMATO.v7i.coco-segmentation/images/valid",
                         help='[detect/segment] Validation images directory')
-    parser.add_argument('--val-ann-file',   type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json",
+    parser.add_argument('--val-ann-file',   type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_valid_fixed.json",
                         help='[detect/segment] Validation COCO annotation JSON')
 
     opt = parser.parse_args()
