@@ -1,9 +1,9 @@
 """
 ViT + ViTDet-style FPN + Faster R-CNN detection head.
-
-ViTDet FPN: single-scale ViT output [B, D, 14, 14] -> multi-scale {P2,P3,P4,P5}
-via deconv/conv, then fed into torchvision FPN lateral fusion.
-Faster R-CNN head: torchvision RPN + RoIAlign + box/cls branches.
+Supports two backbone families:
+  - ViT  (backbone_name starts with "vit_"):  single-scale [B,D,14,14] -> ViTDetFPN
+  - Swin (backbone_name starts with "swin_"): multi-scale dict{p2..p5} -> SwinFPN
+RPN / RoI head are unchanged between the two paths.
 """
 import torch
 import torch.nn as nn
@@ -14,6 +14,11 @@ from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
 
 import model.vit_model as vit_models
+import model.swin_model as swin_models
+
+
+def _is_swin(backbone_name: str) -> bool:
+    return backbone_name.startswith("swin_")
 
 
 class ViTDetFPN(nn.Module):
@@ -51,6 +56,32 @@ class ViTDetFPN(nn.Module):
 
         feat_dict = OrderedDict([("p2", p2), ("p3", p3), ("p4", p4), ("p5", p5)])
         return self.fpn(feat_dict)  # same keys, fused
+
+
+class SwinFPN(nn.Module):
+    """
+    Accepts SwinTransformer.forward_features_map() output dict:
+        {"p2": [B,C,H/4,W/4], "p3": [B,2C,...], "p4": [B,4C,...], "p5": [B,8C,...]}
+    Projects each level to out_channels, then runs torchvision FPN.
+    Output has same keys {p2..p5} — RPN/RoI heads see identical interface as ViTDetFPN.
+    """
+    def __init__(self, embed_dim: int, out_channels: int = 256):
+        super().__init__()
+        stage_channels = [embed_dim * (2 ** i) for i in range(4)]
+        self.laterals = nn.ModuleDict({
+            f"p{i+2}": nn.Conv2d(c, out_channels, 1)
+            for i, c in enumerate(stage_channels)
+        })
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=[out_channels] * 4,
+            out_channels=out_channels,
+        )
+
+    def forward(self, feature_dict: dict) -> OrderedDict:
+        projected = OrderedDict()
+        for key in ["p2", "p3", "p4", "p5"]:
+            projected[key] = self.laterals[key](feature_dict[key])
+        return self.fpn(projected)
 
 
 class FasterRCNNHead(nn.Module):
@@ -95,24 +126,45 @@ class ViTFasterRCNN(nn.Module):
         super().__init__()
 
         # --- backbone ---
-        factory = getattr(vit_models, backbone_name)
-        self.backbone = factory(num_classes=0)  # num_classes=0 -> head is Identity
+        if _is_swin(backbone_name):
+            factory = getattr(swin_models, backbone_name)
+            self.backbone = factory(num_classes=0)
+            if backbone_weights:
+                ckpt = torch.load(backbone_weights, map_location="cpu")
+                state = ckpt.get("model", ckpt.get("model_state", ckpt))
+                state = {k: v for k, v in state.items()
+                         if not k.startswith("head.") and not k.startswith("norm_cls.")}
+                missing, unexpected = self.backbone.load_state_dict(state, strict=False)
+                if missing:
+                    print(f"[Swin] missing keys ({len(missing)}): {missing[:3]} ...")
+                if unexpected:
+                    print(f"[Swin] unexpected keys ({len(unexpected)}): {unexpected[:3]} ...")
+            image_mean, image_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        else:
+            factory = getattr(vit_models, backbone_name)
+            self.backbone = factory(num_classes=0)
+            if backbone_weights:
+                ckpt = torch.load(backbone_weights, map_location="cpu")
+                state = ckpt["model_state"] if "model_state" in ckpt else ckpt
+                state = {k: v for k, v in state.items() if not k.startswith("head.")}
+                self.backbone.load_state_dict(state, strict=False)
+            image_mean, image_std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+
         embed_dim = self.backbone.embed_dim
 
-        if backbone_weights:
-            import torch
-            ckpt = torch.load(backbone_weights, map_location="cpu")
-            state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-            # strip head keys
-            state = {k: v for k, v in state.items() if not k.startswith("head.")}
-            self.backbone.load_state_dict(state, strict=False)
-
         if freeze_backbone:
-            for p in self.backbone.parameters():
+            for name, p in self.backbone.named_parameters():
+                # norm0~norm3 are randomly initialized (not in pretrained weights),
+                # must remain trainable even when backbone is frozen
+                if _is_swin(backbone_name) and name.startswith(("norm0", "norm1", "norm2", "norm3")):
+                    continue
                 p.requires_grad_(False)
 
         # --- neck ---
-        self.neck = ViTDetFPN(in_channels=embed_dim, out_channels=fpn_out_channels)
+        if _is_swin(backbone_name):
+            self.neck = SwinFPN(embed_dim=embed_dim, out_channels=fpn_out_channels)
+        else:
+            self.neck = ViTDetFPN(in_channels=embed_dim, out_channels=fpn_out_channels)
 
         # --- RPN ---
         anchor_sizes = ((32,), (64,), (128,), (256,))
@@ -154,11 +206,11 @@ class ViTFasterRCNN(nn.Module):
             detections_per_img=100,
         )
 
-        # --- image normalization transform (ViT uses 0.5/0.5) ---
+        # --- image normalization transform ---
         self.transform = GeneralizedRCNNTransform(
             min_size=224, max_size=224,
-            image_mean=[0.5, 0.5, 0.5],
-            image_std=[0.5, 0.5, 0.5],
+            image_mean=image_mean,
+            image_std=image_std,
             fixed_size=(224, 224),
         )
 
@@ -173,12 +225,8 @@ class ViTFasterRCNN(nn.Module):
         original_image_sizes = [(img.shape[-2], img.shape[-1]) for img in images]
         images, targets = self.transform(images, targets)
 
-        # backbone: batch tensor -> feature map
-        img_tensor = images.tensors                          # [B, 3, H, W]
-        feat_map = self.backbone.forward_features_map(img_tensor)  # [B, D, 14, 14]
-
-        # neck: single-scale -> multi-scale FPN dict
-        features = self.neck(feat_map)                       # {p2,p3,p4,p5}
+        # backbone -> neck -> FPN dict {p2,p3,p4,p5}
+        features = self.neck(self.backbone.forward_features_map(images.tensors))
 
         # RPN
         proposals, rpn_losses = self.rpn(images, features, targets)

@@ -1,20 +1,18 @@
 """
-ViT + ViTDet-style FPN + Mask R-CNN segmentation head.
-
-Reuses ViTDetFPN from detection_head.py.
-Adds a mask branch on top of Faster R-CNN RoI features.
+ViT/Swin + ViTDet/SwinFPN + Mask R-CNN segmentation head.
+Reuses ViTDetFPN, SwinFPN, FasterRCNNHead, _is_swin from detection_head.py.
 """
 import torch
 import torch.nn as nn
-from collections import OrderedDict
 from torchvision.ops import MultiScaleRoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
 from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor
 
-from model.detection_head import ViTDetFPN, FasterRCNNHead
+from model.detection_head import ViTDetFPN, SwinFPN, FasterRCNNHead, _is_swin
 import model.vit_model as vit_models
+import model.swin_model as swin_models
 
 
 class ViTMaskRCNN(nn.Module):
@@ -45,22 +43,43 @@ class ViTMaskRCNN(nn.Module):
         super().__init__()
 
         # --- backbone ---
-        factory = getattr(vit_models, backbone_name)
-        self.backbone = factory(num_classes=0)
+        if _is_swin(backbone_name):
+            factory = getattr(swin_models, backbone_name)
+            self.backbone = factory(num_classes=0)
+            if backbone_weights:
+                ckpt = torch.load(backbone_weights, map_location="cpu")
+                state = ckpt.get("model", ckpt.get("model_state", ckpt))
+                state = {k: v for k, v in state.items()
+                         if not k.startswith("head.") and not k.startswith("norm_cls.")}
+                missing, unexpected = self.backbone.load_state_dict(state, strict=False)
+                if missing:
+                    print(f"[Swin] missing keys ({len(missing)}): {missing[:3]} ...")
+                if unexpected:
+                    print(f"[Swin] unexpected keys ({len(unexpected)}): {unexpected[:3]} ...")
+            image_mean, image_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        else:
+            factory = getattr(vit_models, backbone_name)
+            self.backbone = factory(num_classes=0)
+            if backbone_weights:
+                ckpt = torch.load(backbone_weights, map_location="cpu")
+                state = ckpt["model_state"] if "model_state" in ckpt else ckpt
+                state = {k: v for k, v in state.items() if not k.startswith("head.")}
+                self.backbone.load_state_dict(state, strict=False)
+            image_mean, image_std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+
         embed_dim = self.backbone.embed_dim
 
-        if backbone_weights:
-            ckpt = torch.load(backbone_weights, map_location="cpu")
-            state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-            state = {k: v for k, v in state.items() if not k.startswith("head.")}
-            self.backbone.load_state_dict(state, strict=False)
-
         if freeze_backbone:
-            for p in self.backbone.parameters():
+            for name, p in self.backbone.named_parameters():
+                if _is_swin(backbone_name) and name.startswith(("norm0", "norm1", "norm2", "norm3")):
+                    continue
                 p.requires_grad_(False)
 
-        # --- neck (shared with detection) ---
-        self.neck = ViTDetFPN(in_channels=embed_dim, out_channels=fpn_out_channels)
+        # --- neck ---
+        if _is_swin(backbone_name):
+            self.neck = SwinFPN(embed_dim=embed_dim, out_channels=fpn_out_channels)
+        else:
+            self.neck = ViTDetFPN(in_channels=embed_dim, out_channels=fpn_out_channels)
 
         # --- RPN ---
         anchor_sizes = ((32,), (64,), (128,), (256,))
@@ -117,8 +136,8 @@ class ViTMaskRCNN(nn.Module):
 
         self.transform = GeneralizedRCNNTransform(
             min_size=224, max_size=224,
-            image_mean=[0.5, 0.5, 0.5],
-            image_std=[0.5, 0.5, 0.5],
+            image_mean=image_mean,
+            image_std=image_std,
             fixed_size=(224, 224),
         )
 
@@ -133,9 +152,8 @@ class ViTMaskRCNN(nn.Module):
         original_image_sizes = [(img.shape[-2], img.shape[-1]) for img in images]
         images, targets = self.transform(images, targets)
 
-        img_tensor = images.tensors
-        feat_map = self.backbone.forward_features_map(img_tensor)  # [B, D, 14, 14]
-        features = self.neck(feat_map)                              # {p2,p3,p4,p5}
+        # backbone -> neck -> FPN dict {p2,p3,p4,p5}
+        features = self.neck(self.backbone.forward_features_map(images.tensors))
 
         proposals, rpn_losses = self.rpn(images, features, targets)
 
