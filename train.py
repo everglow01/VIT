@@ -33,7 +33,14 @@ MODEL_SIGS = {
     "vit_large_patch16_224_in21k": {"patch_size": 16, "embed_dim": 1024, "depth": 24},
     "vit_large_patch32_224_in21k": {"patch_size": 32, "embed_dim": 1024, "depth": 24},
     "vit_huge_patch14_224_in21k":  {"patch_size": 14, "embed_dim": 1280, "depth": 32},
+    # Swin backbones
+    "swin_tiny_patch4_window7_224":  {"embed_dim": 96,  "depths": [2, 2, 6,  2]},
+    "swin_small_patch4_window7_224": {"embed_dim": 96,  "depths": [2, 2, 18, 2]},
+    "swin_base_patch4_window7_224":  {"embed_dim": 128, "depths": [2, 2, 18, 2]},
 }
+
+def _is_swin(name: str) -> bool:
+    return name.startswith("swin_")
 
 def _strip_module_prefix(state_dict):
     # 兼容 DataParallel / DDP 保存的 "module.xxx"
@@ -131,6 +138,11 @@ def _smart_load_weights(model, ckpt, args, device):
     # （否则 strict=False 可能让你误以为加载成功，但其实没加载多少）
     MIN_KEEP_RATIO = 0.85
     if keep_ratio < MIN_KEEP_RATIO:
+        if _is_swin(getattr(args, 'model', '')):
+            raise RuntimeError(
+                f"Swin 权重与模型不匹配（keep_ratio={keep_ratio:.2%}）\n"
+                f"请确认 --model 与权重文件对应（tiny/small/base）。"
+            )
         w_sig = _infer_vit_sig_from_weights(state_dict)
         suggestions = _suggest_models_by_sig(w_sig)
 
@@ -167,7 +179,11 @@ def _smart_load_weights(model, ckpt, args, device):
 
 
 def build_model_and_prepare(args, device, num_classes: int):
-    create_model = getattr(vit_models, args.model, None)
+    import model.swin_model as swin_models
+    if _is_swin(args.model):
+        create_model = getattr(swin_models, args.model, None)
+    else:
+        create_model = getattr(vit_models, args.model, None)
     if create_model is None or not callable(create_model):
         # 给出可选项：只列出 vit_model 里"看起来像 ViT 工厂函数"的名字
         candidates = [n for n in MODEL_SIGS.keys() if hasattr(vit_models, n)]
@@ -477,16 +493,18 @@ if __name__ == '__main__':
     # ---- common ----
     parser.add_argument('--epochs',     type=int,   default=100)
     parser.add_argument('--batch-size', type=int,   default=4)
-    parser.add_argument('--lr',         type=float, default=1e-4,
-                        help='Learning rate. Recommended: 0.001 for classify, 1e-4 for detect/segment')
+    parser.add_argument('--lr',         type=float, default=0.001,
+                        help='Learning rate. Recommended: 0.001 for detection/segmentation with AdamW; 0.01 for classification with SGD.')
     parser.add_argument('--lrf',        type=float, default=0.01)
-    parser.add_argument('--model',      type=str,   default="vit_base_patch16_224_in21k")
-    parser.add_argument('--weights',    type=str,   default='weights/jx_vit_base_patch16_224_in21k-e5005f0a.pth',
+    parser.add_argument('--model',      type=str,   default="swin_small_patch4_window7_224",
+                        help='Backbone name. ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k | vit_huge_patch14_224_in21k. '
+                             'Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224')
+    parser.add_argument('--weights',    type=str,   default='weights/swin_small_patch4_window7_224.pth',
                         help='Pretrained backbone weights path; pass empty string to skip')
     parser.add_argument('--freeze-layers', type=lambda x: x.lower() == 'true', default=True,
                         help='Freeze backbone layers. Pass True or False. Example: --freeze-layers False')
     parser.add_argument('--device',     type=str,   default='cuda:0')
-    parser.add_argument('--eval-interval', type=int, default=10,
+    parser.add_argument('--eval-interval', type=int, default=1,
                         help='[detect/segment] Run evaluation every N epochs (last epoch is always evaluated)')
 
     # ---- classify only ----

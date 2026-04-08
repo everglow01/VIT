@@ -11,6 +11,7 @@ from torchvision import transforms
 
 from tools.create_exp_folder import create_val_exp_folder
 import model.vit_model as vit_models
+import model.swin_model as swin_models
 
 # ===== shared config =====
 IMG_SIZE = 224
@@ -210,7 +211,8 @@ def run_classify(args, device, exp_folder):
         else:
             raise RuntimeError("Cannot infer num_classes. Provide --class-indices or --num-classes.")
 
-    factory = getattr(vit_models, args.model_name, None)
+    factory = getattr(swin_models, args.model_name, None) if args.model_name.startswith("swin_") \
+        else getattr(vit_models, args.model_name, None)
     if factory is None or not callable(factory):
         raise ValueError(f"Unknown --model-name: {args.model_name}")
     model = factory(num_classes=num_classes).to(device)
@@ -442,14 +444,17 @@ if __name__ == "__main__":
 
     # ---- common ----
     parser.add_argument("--data",       type=str, default="data/TOMATO.v5i.coco-segmentation/valid")
-    parser.add_argument("--weights",    type=str, default="run/train/exp16/weights/best.pth")
-    parser.add_argument("--model-name", type=str, default="vit_base_patch16_224_in21k")
+    parser.add_argument("--weights",    type=str, default="run/train/exp22/weights/best.pth")
+    parser.add_argument("--model-name", type=str, default="swin_small_patch4_window7_224",
+                        help="Backbone name used during training. "
+                             "ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k. "
+                             "Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224")
     parser.add_argument("--device",     type=str, default="cuda:0")
     # parser.add_argument("--draw",       action="store_true", default=True)
     # 如果想默认开启 draw，改用 BooleanOptionalAction（Python 3.9+）
     parser.add_argument("--draw", action=argparse.BooleanOptionalAction, default=True)
     # 用户可以用 --no-draw 来关闭
-    parser.add_argument("--num-classes", type=int, default=3,
+    parser.add_argument("--num-classes", type=int, default=2,
                         help="Required for detect/segment; optional for classify")
     parser.add_argument("--ann-file", type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json",
                         help="Optional COCO annotation JSON for detect/segment class names")
