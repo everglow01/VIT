@@ -1,4 +1,4 @@
-# Vision Transformer for Classify, Detection and Segmentation
+# Vision Transformer + Swin Transformer for Classify, Detection and Segmentation
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <b>🌿 ViT Learning Project for Classification, Detection, and Segmentation</b>
+  <b>🌿 ViT/Swin Learning Project for Classification, Detection, and Segmentation</b>
 </p>
 
 <p align="center">
@@ -30,17 +30,17 @@ By using this repository, you agree to these restrictions.
 
 ## 🧭 Overview
 
-This project brings Vision Transformer (ViT) into three classic computer vision tasks — image classification, object detection, and instance segmentation — all under one unified training and inference entry point.
+This project brings Vision Transformer (ViT) and Swin Transformer into three classic computer vision tasks — image classification, object detection, and instance segmentation — all under one unified training and inference entry point.
 
-The backbone is a pretrained ViT (ImageNet-21k), extended with an FPN neck and task-specific heads: a Fast R-CNN style head for detection, and a Mask R-CNN style mask branch on top for segmentation. Transfer learning is the default workflow — freeze the backbone, fine-tune the head, and get results fast even on limited hardware.
+The backbone can be either pretrained ViT or pretrained Swin, extended with an FPN neck and task-specific heads: a Fast R-CNN style head for detection, and a Mask R-CNN style mask branch on top for segmentation. Transfer learning is the default workflow — freeze the backbone, fine-tune the head, and get results fast even on limited hardware.
 
 Beyond training, the project puts some effort into making results actually readable: COCO-standard mAP evaluation, per-class AP charts, PR curves, F1-confidence curves, confusion matrices with background, calibration curves, and scale/mask analysis are all generated automatically at the end of training. No extra scripts needed.
 
 ## ✨ Key Features
 
-- Multiple ViT backbones (base / large / huge, patch 14/16/32)
+- Multiple backbones: ViT (base / large / huge) and Swin (tiny / small / base)
 - Three tasks in one entry point: classification, detection, segmentation
-- Detection via ViT + FPN neck + Fast R-CNN head; segmentation adds Mask R-CNN style mask branch
+- Detection via ViT/Swin + FPN neck + Fast R-CNN head; segmentation adds Mask R-CNN style mask branch
 - COCO-format training and evaluation with pycocotools mAP (mAP@0.5, mAP@0.5:0.95)
 - Classification metrics: loss, accuracy, macro precision / recall / F1 per epoch
 - Rich post-training evaluation charts for detection/segmentation:
@@ -50,16 +50,17 @@ Beyond training, the project puts some effort into making results actually reada
 - Auto-increment experiment folders (`run/train/expN`)
 - Inference with optional visualization (`--draw`) and TSV prediction export
 ### 🔍 About Detection
-The traditional VIT backbone was used, a YOLO-like FPN neck was added, and finally, a torch-style Fast R-CNN was used for the final regression and classification.
+Supports both ViT and Swin backbones. A unified FPN neck is used before a torch-style Fast R-CNN head for final regression and classification.
 
 ### 🧩 About Segmentation
-The same ViT + FPN backbone pipeline is used, and a Mask R-CNN style mask branch is added on top of the detection head to predict pixel-level instance masks together with box classification and regression.
+The same ViT/Swin + FPN backbone pipeline is used, and a Mask R-CNN style mask branch is added on top of the detection head to predict pixel-level instance masks together with box classification and regression.
 
 ## 🗂️ Project Structure
 
 - `train.py`: Unified entry for `classify`, `detect`, `segment`
 - `predict.py`: Inference for single image or directory
 - `model/vit_model.py`: ViT backbone implementation
+- `model/swin_model.py`: Swin backbone implementation
 - `model/detection_head.py`: Detection head
 - `model/segmentation_head.py`: Segmentation head
 - `tools/my_dataset.py`: Classification dataset and dataloaders
@@ -117,7 +118,7 @@ This section is added as a supplement and does not replace any existing content 
 | Argument | Task | Meaning |
 |----------|------|---------|
 | `--task` | all | choose from classify / detect / segment |
-| `--model` | train | ViT backbone variant used in training |
+| `--model` | train | backbone variant used in training (ViT/Swin) |
 | `--weights` | train | pretrained or resume checkpoint path |
 | `--batch-size` | train | batch size (reduce if OOM) |
 | `--eval-interval` | detect/segment | run evaluation every N epochs (and always at last epoch) |
@@ -188,7 +189,7 @@ path/to/img1.jpg\tstem\t0.9321\t120.6\t88.4\t232.5\t210.3
 
 - **Freeze the backbone first.** Unless you have a large dataset, keep `--freeze-layers True` and only fine-tune the head. It trains faster and avoids overfitting on small data.
 
-- **VRAM is the main bottleneck.** ViT is memory-hungry. If you hit OOM, drop `--batch-size` to 2–4 first. Detection/segmentation needs at least 8 GB; classification is more forgiving.
+- **VRAM is the main bottleneck.** ViT/Swin backbones are memory-hungry. If you hit OOM, drop `--batch-size` to 2–4 first. Detection/segmentation needs at least 8 GB; classification is more forgiving.
 
 - **Evaluation runs on the last epoch (and every `--eval-interval` epochs).** The default interval is 10 to keep training fast. Set `--eval-interval 1` if you want per-epoch mAP, but expect slower runs.
 
@@ -219,15 +220,16 @@ python train.py \
 ```bash
 python train.py \
   --task detect \
-  --train-img-dir data/val2017 \
-  --train-ann-file data/annotations_trainval2017/annotations/instances_val2017.json \
-  --val-img-dir data/val2017 \
-  --val-ann-file data/annotations_trainval2017/annotations/instances_val2017.json \
-  --model vit_base_patch16_224_in21k \
-  --weights weights/jx_vit_base_patch16_224_in21k-e5005f0a.pth \
+  --train-img-dir data/TOMATO.v5i.coco-segmentation/train \
+  --train-ann-file data/TOMATO.v5i.coco-segmentation/annotation/annotations_train.coco.json \
+  --val-img-dir data/TOMATO.v5i.coco-segmentation/valid \
+  --val-ann-file data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json \
+  --model swin_small_patch4_window7_224 \
+  --weights weights/swin_small_patch4_window7_224.pth \
   --epochs 100 \
-  --eval-interval 10 \
-  --batch-size 8 \
+  --eval-interval 1 \
+  --batch-size 4 \
+  --lr 0.001 \
   --device cuda:0
 ```
 
@@ -236,17 +238,32 @@ python train.py \
 ```bash
 python train.py \
   --task segment \
-  --train-img-dir data/val2017 \
-  --train-ann-file data/annotations_trainval2017/annotations/instances_val2017.json \
-  --val-img-dir data/val2017 \
-  --val-ann-file data/annotations_trainval2017/annotations/instances_val2017.json \
-  --model vit_base_patch16_224_in21k \
-  --weights weights/jx_vit_base_patch16_224_in21k-e5005f0a.pth \
+  --train-img-dir data/TOMATO.v5i.coco-segmentation/train \
+  --train-ann-file data/TOMATO.v5i.coco-segmentation/annotation/annotations_train.coco.json \
+  --val-img-dir data/TOMATO.v5i.coco-segmentation/valid \
+  --val-ann-file data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json \
+  --model swin_small_patch4_window7_224 \
+  --weights weights/swin_small_patch4_window7_224.pth \
   --epochs 100 \
-  --eval-interval 10 \
-  --batch-size 8 \
+  --eval-interval 1 \
+  --batch-size 4 \
+  --lr 0.001 \
   --device cuda:0
 ```
+
+### 4) Available Backbone Names
+
+ViT:
+- `vit_base_patch16_224_in21k`
+- `vit_base_patch32_224_in21k`
+- `vit_large_patch16_224_in21k`
+- `vit_large_patch32_224_in21k`
+- `vit_huge_patch14_224_in21k`
+
+Swin:
+- `swin_tiny_patch4_window7_224`
+- `swin_small_patch4_window7_224`
+- `swin_base_patch4_window7_224`
 
 ## 📌 Usage Examples
 
@@ -282,10 +299,12 @@ python train.py \
 
 ```bash
 python predict.py \
+  --task segment \
   --data path/to/target.jpg \
-  --weights run/train/exp/weights/best.pth \
-  --class-indices run/train/exp/class_indices.json \
-  --model-name vit_base_patch16_224_in21k \
+  --weights run/train/exp22/weights/best.pth \
+  --model-name swin_small_patch4_window7_224 \
+  --num-classes 2 \
+  --ann-file data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json \
   --device cuda:0 \
   --draw
 ```
@@ -294,10 +313,12 @@ python predict.py \
 
 ```bash
 python predict.py \
+  --task segment \
   --data path/to/images_dir \
-  --weights run/train/exp/weights/best.pth \
-  --class-indices run/train/exp/class_indices.json \
-  --model-name vit_base_patch16_224_in21k \
+  --weights run/train/exp22/weights/best.pth \
+  --model-name swin_small_patch4_window7_224 \
+  --num-classes 2 \
+  --ann-file data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json \
   --device cuda:0
 ```
 
@@ -336,6 +357,7 @@ Detection/segmentation including:
 - If CUDA is unavailable, training may fall back to CPU and become much slower.
 - Detection/segmentation workloads are significantly heavier than classification.
 - Make sure model architecture matches pretrained weights (patch size, embed dim, depth).
+- For detect/segment inference, `--num-classes` must match the training checkpoint exactly (foreground class count only).
 
 ## 🔒 Final Reminder
 
