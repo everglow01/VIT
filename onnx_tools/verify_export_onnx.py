@@ -3,100 +3,15 @@ import os
 import sys
 import numpy as np
 import torch
-import torch.nn as nn
 
-# Allow running as: python3 onnx_tools/verify_export_onnx.py ...
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import model.vit_model as vit_models
-import model.swin_model as swin_models
-from model.detection_head import build_detection_model
-from model.segmentation_head import build_segmentation_model
-
-
-def _build_model_registry():
-    names = [
-        "vit_base_patch16_224_in21k",
-        "vit_base_patch32_224_in21k",
-        "vit_large_patch16_224_in21k",
-        "vit_large_patch32_224_in21k",
-        "vit_huge_patch14_224_in21k",
-        "swin_tiny_patch4_window7_224",
-        "swin_small_patch4_window7_224",
-        "swin_base_patch4_window7_224",
-        "swin_base_patch4_window12_384",
-        "swin_large_patch4_window7_224",
-        "swin_large_patch4_window12_384",
-    ]
-
-    registry = {}
-    for n in names:
-        fn = getattr(vit_models, n, None)
-        if fn is None:
-            fn = getattr(swin_models, n, None)
-        if callable(fn):
-            registry[n] = fn
-    return registry
-
-
-MODEL_BUILDERS = _build_model_registry()
-
-
-def _is_detseg_checkpoint(state_dict: dict) -> bool:
-    if not isinstance(state_dict, dict):
-        return False
-    for k in state_dict.keys():
-        if isinstance(k, str) and (
-            k.startswith("backbone.") or
-            k.startswith("neck.") or
-            k.startswith("rpn.") or
-            k.startswith("roi_heads.")
-        ):
-            return True
-    return False
-
-
-def _is_seg_checkpoint(state_dict: dict) -> bool:
-    if not isinstance(state_dict, dict):
-        return False
-    return any(isinstance(k, str) and "mask_head" in k for k in state_dict)
-
-
-def _load_checkpoint_state(weights_path: str, device: torch.device):
-    state = torch.load(weights_path, map_location=device)
-    if isinstance(state, dict):
-        if "model_state" in state:
-            state = state["model_state"]
-        elif "model" in state:
-            state = state["model"]
-        elif "state_dict" in state:
-            state = state["state_dict"]
-    if not isinstance(state, dict):
-        raise RuntimeError("Unsupported checkpoint format: expected state_dict or checkpoint dict.")
-    return state
-
-
-class DetectionWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model.eval()
-
-    def forward(self, x):
-        out = self.model([x[0]])[0]
-        return out["boxes"], out["scores"], out["labels"]
-
-
-class SegmentationWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model.eval()
-
-    def forward(self, x):
-        out = self.model([x[0]])[0]
-        masks = out.get("masks", torch.zeros(0, 1, 1, 1, device=x.device))
-        return out["boxes"], out["scores"], out["labels"], masks
+from onnx_tools.common import (
+    MODEL_BUILDERS, detect_task, load_state, build_model,
+    DetectionWrapper, SegmentationWrapper, TASK_OUTPUT_NAMES,
+)
 
 
 def _print_metrics(torch_out: np.ndarray, onnx_out: np.ndarray):
@@ -155,83 +70,54 @@ def _compare_one_output(name: str, torch_out: np.ndarray, onnx_out: np.ndarray, 
 
 def main():
     parser = argparse.ArgumentParser(description="Verify ONNX export by comparing ONNXRuntime vs PyTorch outputs")
-    parser.add_argument("--weights", "--weight", dest="weights", type=str, required=True,
-                        help="Path to .pt/.pth checkpoint used for ONNX export")
+    parser.add_argument("--weights", "--weight", dest="weights", type=str, required=True)
     parser.add_argument("--onnx", type=str, default=None,
                         help="Path to exported .onnx (default: replace weights suffix with .onnx)")
-    parser.add_argument("--model", type=str, required=True, choices=list(MODEL_BUILDERS.keys()),
-                        help="Model architecture name")
-    parser.add_argument("--task", type=str, default="auto", choices=["auto", "classify", "detect", "segment"],
-                        help="Task type (default: auto-detect from checkpoint)")
-    parser.add_argument("--num-classes", type=int, required=True, help="Number of output classes")
-    parser.add_argument("--input-size", type=int, default=224, help="Input image size")
-    parser.add_argument("--batch-size", type=int, default=1, help="Random test batch size")
-    parser.add_argument("--atol", type=float, default=1e-3, help="Absolute tolerance pass threshold")
-    parser.add_argument("--rtol", type=float, default=1e-2, help="Relative tolerance pass threshold")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for deterministic input")
-    parser.add_argument("--device", type=str, default="cpu", help="cpu or cuda for PyTorch reference")
+    parser.add_argument("--model", type=str, required=True, choices=list(MODEL_BUILDERS.keys()))
+    parser.add_argument("--task", type=str, default="auto", choices=["auto", "classify", "detect", "segment"])
+    parser.add_argument("--num-classes", type=int, required=True)
+    parser.add_argument("--input-size", type=int, default=224)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--atol", type=float, default=1e-3)
+    parser.add_argument("--rtol", type=float, default=1e-2)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
     if not os.path.isfile(args.weights):
         raise FileNotFoundError(f"weights not found: {args.weights}")
 
-    onnx_path = args.onnx if args.onnx else os.path.splitext(args.weights)[0] + ".onnx"
+    onnx_path = args.onnx or (os.path.splitext(args.weights)[0] + ".onnx")
     if not os.path.isfile(onnx_path):
         raise FileNotFoundError(f"onnx not found: {onnx_path}")
 
     try:
         import onnxruntime as ort
     except Exception as e:
-        raise RuntimeError(
-            "onnxruntime is required for verification. Install with: pip install onnxruntime"
-        ) from e
+        raise RuntimeError("onnxruntime is required. Install with: pip install onnxruntime") from e
 
     device = torch.device(
         args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) else "cpu"
     )
 
-    # Build and load PyTorch model
-    state = _load_checkpoint_state(args.weights, device)
-
-    task = args.task
-    if task == "auto":
-        if _is_detseg_checkpoint(state):
-            task = "segment" if _is_seg_checkpoint(state) else "detect"
-        else:
-            task = "classify"
+    state = load_state(args.weights, device)
+    task = detect_task(state) if args.task == "auto" else args.task
     print(f"Task: {task}")
 
-    if task == "classify":
-        model = MODEL_BUILDERS[args.model](num_classes=args.num_classes).to(device)
-        msg = model.load_state_dict(state, strict=False)
-        print(msg)
-        model.eval()
-        ref_model = model
-        output_names = ["logits"]
-    elif task == "detect":
-        det = build_detection_model(
-            backbone_name=args.model,
-            num_classes=args.num_classes,
-            backbone_weights="",
-            freeze_backbone=False,
-        ).to(device)
-        msg = det.load_state_dict(state, strict=False)
-        print(msg)
-        ref_model = DetectionWrapper(det).to(device).eval()
-        output_names = ["boxes", "scores", "labels"]
-    else:
-        seg = build_segmentation_model(
-            backbone_name=args.model,
-            num_classes=args.num_classes,
-            backbone_weights="",
-            freeze_backbone=False,
-        ).to(device)
-        msg = seg.load_state_dict(state, strict=False)
-        print(msg)
-        ref_model = SegmentationWrapper(seg).to(device).eval()
-        output_names = ["boxes", "scores", "labels", "masks"]
+    net = build_model(task, args.model, args.num_classes, device)
+    msg = net.load_state_dict(state, strict=False)
+    print(msg)
+    net.eval()
 
-    # Prepare deterministic random input
+    if task == "detect":
+        ref_model = DetectionWrapper(net).to(device).eval()
+    elif task == "segment":
+        ref_model = SegmentationWrapper(net).to(device).eval()
+    else:
+        ref_model = net
+
+    _, output_names, _ = TASK_OUTPUT_NAMES[task]
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     x = torch.randn(args.batch_size, 3, args.input_size, args.input_size, device=device)
@@ -242,7 +128,6 @@ def main():
         ref_out = (ref_out,)
     torch_outputs = [o.detach().cpu().numpy() for o in ref_out]
 
-    # ONNXRuntime inference
     providers = ["CPUExecutionProvider"]
     session = ort.InferenceSession(onnx_path, providers=providers)
     input_name = session.get_inputs()[0].name
@@ -256,15 +141,13 @@ def main():
     for i, (t, o) in enumerate(zip(torch_outputs, onnx_outputs)):
         name = output_names[i] if i < len(output_names) else f"output_{i}"
         print(f"\n[{name}] torch_dtype={t.dtype} onnx_dtype={o.dtype}")
-        ok = _compare_one_output(name, t, o, args.atol, args.rtol)
-        all_ok = all_ok and ok
+        all_ok &= _compare_one_output(name, t, o, args.atol, args.rtol)
 
     if all_ok:
         print(f"\nPASS: all outputs within tolerance (atol={args.atol}, rtol={args.rtol})")
-        return
-
-    print(f"\nFAIL: at least one output out of tolerance (atol={args.atol}, rtol={args.rtol})")
-    sys.exit(1)
+    else:
+        print(f"\nFAIL: at least one output out of tolerance (atol={args.atol}, rtol={args.rtol})")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
