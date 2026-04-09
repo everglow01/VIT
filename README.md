@@ -322,6 +322,54 @@ python predict.py \
   --device cuda:0
 ```
 
+## 🔧 ONNX Export
+
+Export a trained checkpoint to ONNX format. Task type is auto-detected from the checkpoint keys.
+
+```bash
+# Export (task auto-detected)
+python onnx_tools/export_onnx.py \
+  --weights run/train/expN/weights/best.pth \
+  --model swin_small_patch4_window7_224 \
+  --num-classes 2
+
+# Override output path
+python onnx_tools/export_onnx.py \
+  --weights run/train/expN/weights/best.pth \
+  --model swin_small_patch4_window7_224 \
+  --num-classes 2 \
+  --output exported/model.onnx
+
+# Force task type
+python onnx_tools/export_onnx.py \
+  --weights best.pth \
+  --model vit_base_patch16_224_in21k \
+  --num-classes 26 \
+  --task classify
+```
+
+By default the `.onnx` file is saved next to the weights file with the same name.
+
+Verify the exported model matches PyTorch outputs (requires `pip install onnxruntime`):
+
+```bash
+python onnx_tools/verify_export_onnx.py \
+  --weights run/train/expN/weights/best.pth \
+  --model swin_small_patch4_window7_224 \
+  --num-classes 2
+```
+
+| Argument | Default | Meaning |
+|----------|---------|---------|
+| `--weights` | required | `.pt` / `.pth` checkpoint |
+| `--model` | `vit_base_patch16_224_in21k` | backbone architecture name |
+| `--num-classes` | required | foreground class count |
+| `--task` | `auto` | `auto` / `classify` / `detect` / `segment` |
+| `--output` | same dir as weights | output `.onnx` path |
+| `--input-size` | `224` | input image size |
+| `--opset` | `17` | ONNX opset version |
+| `--device` | `cpu` | `cpu` or `cuda` |
+
 ## 📁 Outputs
 
 Training outputs are saved under `run/train/expN/`,   
