@@ -17,7 +17,7 @@ import model.swin_model as swin_models
 IMG_SIZE = 224
 MEAN = (0.5, 0.5, 0.5)
 STD  = (0.5, 0.5, 0.5)
-CONF_THRESH = 0.9
+CONF_THRESH = 0.4
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp",
             ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
 
@@ -239,7 +239,7 @@ def run_classify(args, device, exp_folder):
 
 
 # ============================================================
-# Detection helpers
+# Detection / Segmentation helpers
 # ============================================================
 
 def draw_boxes(img: Image.Image, boxes, labels, scores, class_map=None) -> Image.Image:
@@ -257,6 +257,68 @@ def draw_boxes(img: Image.Image, boxes, labels, scores, class_map=None) -> Image
         draw.rectangle(tb, fill=color)
         draw.text((x1, y1 - 18), text, fill=(255, 255, 255), font=font)
     return img
+
+
+def draw_masks(img: Image.Image, boxes, labels, scores, masks, class_map=None) -> Image.Image:
+    """Overlay semi-transparent masks and bounding boxes."""
+    img = img.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+
+    for box, label, score, mask in zip(boxes, labels, scores, masks):
+        cls_id = int(label)
+        r, g, b = _color(cls_id)
+        m = (mask[0] > 0.5).astype(np.uint8)
+        m_pil = Image.fromarray(m * 255, mode="L")
+        color_layer = Image.new("RGBA", img.size, (r, g, b, 100))
+        overlay.paste(color_layer, mask=m_pil)
+
+    img = Image.alpha_composite(img, overlay).convert("RGB")
+    img = draw_boxes(img, boxes, labels, scores, class_map)
+    return img
+
+
+def _run_detseg(args, device, exp_folder, model, ckpt, draw_fn):
+    class_map = resolve_detseg_class_map(args, ckpt, args.num_classes)
+    img_paths = collect_images(args.data)
+    print(f"[INFO] Found {len(img_paths)} images.")
+
+    img_out_dir = os.path.join(exp_folder, "images")
+    os.makedirs(img_out_dir, exist_ok=True)
+
+    txt_path = os.path.join(exp_folder, "predictions.txt")
+    to_tensor = transforms.ToTensor()
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("image_path\tlabel\tscore\tx1\ty1\tx2\ty2\n")
+        for p in img_paths:
+            img_pil = Image.open(p).convert("RGB")
+            out = model([to_tensor(img_pil).to(device)])[0]
+
+            boxes  = out["boxes"].cpu().numpy()
+            labels = out["labels"].cpu().numpy()
+            scores = out["scores"].cpu().numpy()
+            masks  = out["masks"].cpu().numpy() if "masks" in out else None
+
+            keep = scores >= CONF_THRESH
+            boxes  = boxes[keep]
+            labels = labels[keep]
+            scores = scores[keep]
+            if masks is not None:
+                masks = masks[keep]
+
+            for box, label, score in zip(boxes, labels, scores):
+                x1, y1, x2, y2 = box
+                name = class_map.get(int(label), str(label)) if class_map else str(label)
+                f.write(f"{p}\t{name}\t{score:.4f}\t{x1:.1f}\t{y1:.1f}\t{x2:.1f}\t{y2:.1f}\n")
+
+            if args.draw:
+                vis = draw_fn(img_pil.copy(), boxes, labels, scores, masks, class_map) if masks is not None \
+                    else draw_fn(img_pil.copy(), boxes, labels, scores, class_map)
+                vis.save(os.path.join(img_out_dir, os.path.basename(p)))
+
+    print(f"[INFO] Saved predictions to: {txt_path}")
+    if args.draw:
+        print(f"[INFO] Saved visualizations to: {img_out_dir}")
 
 
 @torch.no_grad()
@@ -279,75 +341,7 @@ def run_detect(args, device, exp_folder):
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    class_map = resolve_detseg_class_map(args, ckpt, num_classes)
-    img_paths = collect_images(args.data)
-    print(f"[INFO] Found {len(img_paths)} images.")
-
-    img_out_dir = os.path.join(exp_folder, "images")
-    os.makedirs(img_out_dir, exist_ok=True)
-
-    txt_path = os.path.join(exp_folder, "predictions.txt")
-    to_tensor = transforms.ToTensor()
-
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("image_path\tlabel\tscore\tx1\ty1\tx2\ty2\n")
-        for p in img_paths:
-            img_pil = Image.open(p).convert("RGB")
-            img_tensor = to_tensor(img_pil).to(device)
-            outputs = model([img_tensor])
-            out = outputs[0]
-
-            boxes  = out["boxes"].cpu().numpy()
-            labels = out["labels"].cpu().numpy()
-            scores = out["scores"].cpu().numpy()
-
-            keep = scores >= CONF_THRESH
-            boxes = boxes[keep]
-            labels = labels[keep]
-            scores = scores[keep]
-
-            for box, label, score in zip(boxes, labels, scores):
-                x1, y1, x2, y2 = box
-                name = class_map.get(int(label), str(label)) if class_map else str(label)
-                f.write(f"{p}\t{name}\t{score:.4f}\t{x1:.1f}\t{y1:.1f}\t{x2:.1f}\t{y2:.1f}\n")
-
-            if args.draw:
-                vis = draw_boxes(img_pil.copy(), boxes, labels, scores, class_map)
-                vis.save(os.path.join(img_out_dir, os.path.basename(p)))
-
-    print(f"[INFO] Saved predictions to: {txt_path}")
-    if args.draw:
-        print(f"[INFO] Saved visualizations to: {img_out_dir}")
-
-
-# ============================================================
-# Segmentation helpers
-# ============================================================
-
-def draw_masks(img: Image.Image, boxes, labels, scores, masks, class_map=None) -> Image.Image:
-    """Overlay semi-transparent masks and bounding boxes."""
-    img = img.convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw_ov = ImageDraw.Draw(overlay)
-
-    for box, label, score, mask in zip(boxes, labels, scores, masks):
-        cls_id = int(label)
-        r, g, b = _color(cls_id)
-        # mask: [1, H, W] float -> binary numpy
-        m = (mask[0] > 0.5).astype(np.uint8)  # [H, W]
-        # draw filled mask pixels
-        # ys, xs = np.where(m)
-        # for y, x in zip(ys.tolist(), xs.tolist()):
-        #     draw_ov.point((x, y), fill=(r, g, b, 100))
-        # 用 PIL 直接从 numpy mask 贴图，速度提升 100x+
-        m_pil = Image.fromarray(m * 255, mode="L")
-        color_layer = Image.new("RGBA", img.size, (r, g, b, 100))
-        overlay.paste(color_layer, mask=m_pil)
-
-    img = Image.alpha_composite(img, overlay).convert("RGB")
-    # draw boxes on top
-    img = draw_boxes(img, boxes, labels, scores, class_map)
-    return img
+    _run_detseg(args, device, exp_folder, model, ckpt, draw_boxes)
 
 
 @torch.no_grad()
@@ -370,47 +364,7 @@ def run_segment(args, device, exp_folder):
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    class_map = resolve_detseg_class_map(args, ckpt, num_classes)
-    img_paths = collect_images(args.data)
-    print(f"[INFO] Found {len(img_paths)} images.")
-
-    img_out_dir = os.path.join(exp_folder, "images")
-    os.makedirs(img_out_dir, exist_ok=True)
-
-    txt_path = os.path.join(exp_folder, "predictions.txt")
-    to_tensor = transforms.ToTensor()
-
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("image_path\tlabel\tscore\tx1\ty1\tx2\ty2\n")
-        for p in img_paths:
-            img_pil = Image.open(p).convert("RGB")
-            img_tensor = to_tensor(img_pil).to(device)
-            outputs = model([img_tensor])
-            out = outputs[0]
-
-            boxes  = out["boxes"].cpu().numpy()
-            labels = out["labels"].cpu().numpy()
-            scores = out["scores"].cpu().numpy()
-            masks  = out["masks"].cpu().numpy()   # [N, 1, H, W]
-
-            keep = scores >= CONF_THRESH
-            boxes = boxes[keep]
-            labels = labels[keep]
-            scores = scores[keep]
-            masks = masks[keep]
-
-            for box, label, score in zip(boxes, labels, scores):
-                x1, y1, x2, y2 = box
-                name = class_map.get(int(label), str(label)) if class_map else str(label)
-                f.write(f"{p}\t{name}\t{score:.4f}\t{x1:.1f}\t{y1:.1f}\t{x2:.1f}\t{y2:.1f}\n")
-
-            if args.draw:
-                vis = draw_masks(img_pil.copy(), boxes, labels, scores, masks, class_map)
-                vis.save(os.path.join(img_out_dir, os.path.basename(p)))
-
-    print(f"[INFO] Saved predictions to: {txt_path}")
-    if args.draw:
-        print(f"[INFO] Saved visualizations to: {img_out_dir}")
+    _run_detseg(args, device, exp_folder, model, ckpt, draw_masks)
 
 
 # ============================================================
@@ -420,7 +374,6 @@ def run_segment(args, device, exp_folder):
 def main(args):
     device = torch.device(args.device if torch.cuda.is_available() and "cuda" in args.device else "cpu")
     exp_folder = create_val_exp_folder()
-    os.makedirs(exp_folder, exist_ok=True)
 
     if not os.path.exists(args.weights):
         raise FileNotFoundError(f"weights not found: {args.weights}")
@@ -443,8 +396,8 @@ if __name__ == "__main__":
                         choices=["classify", "detect", "segment"])
 
     # ---- common ----
-    parser.add_argument("--data",       type=str, default="data/TOMATO.v5i.coco-segmentation/valid")
-    parser.add_argument("--weights",    type=str, default="run/train/exp22/weights/best.pth")
+    parser.add_argument("--data",       type=str, default="data/TOMATO.v7i.coco-segmentation/images/train")
+    parser.add_argument("--weights",    type=str, default="run/train/exp26/weights/last.pth")
     parser.add_argument("--model-name", type=str, default="swin_small_patch4_window7_224",
                         help="Backbone name used during training. "
                              "ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k. "
@@ -454,9 +407,9 @@ if __name__ == "__main__":
     # 如果想默认开启 draw，改用 BooleanOptionalAction（Python 3.9+）
     parser.add_argument("--draw", action=argparse.BooleanOptionalAction, default=True)
     # 用户可以用 --no-draw 来关闭
-    parser.add_argument("--num-classes", type=int, default=2,
+    parser.add_argument("--num-classes", type=int, default=3,
                         help="Required for detect/segment; optional for classify")
-    parser.add_argument("--ann-file", type=str, default="data/TOMATO.v5i.coco-segmentation/annotation/annotations_val.coco.json",
+    parser.add_argument("--ann-file", type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_valid_fixed.json",
                         help="Optional COCO annotation JSON for detect/segment class names")
 
     # ---- classify only ----

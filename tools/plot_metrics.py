@@ -30,11 +30,11 @@ def set_scientific_style():
     })
 
 
-def plot_from_metrics_csv(metrics_csv: str, out_dir: str, smooth: int = 1):
+def plot_from_metrics_csv(metrics_csv: str, out_dir: str):
     """
     读取 metrics.csv 并在 out_dir 下输出：
-      - loss_curve.png / .pdf
-      - acc_curve.png  / .pdf
+      - loss_curve.png
+      - acc_curve.png
     """
     if not os.path.exists(metrics_csv):
         raise FileNotFoundError(f"metrics.csv not found: {metrics_csv}")
@@ -50,11 +50,6 @@ def plot_from_metrics_csv(metrics_csv: str, out_dir: str, smooth: int = 1):
     set_scientific_style()
 
     e = df["epoch"].to_numpy()
-
-    # ---- Loss ----
-    # tr_loss = moving_average(df["train_loss"].to_numpy(), smooth)
-    # va_loss = moving_average(df["val_loss"].to_numpy(), smooth)
-
     tr_loss = df["train_loss"].to_numpy()
     va_loss = df["val_loss"].to_numpy()
 
@@ -65,33 +60,22 @@ def plot_from_metrics_csv(metrics_csv: str, out_dir: str, smooth: int = 1):
     plt.ylabel("Loss")
     plt.title("Training / Validation Loss")
     plt.legend()
-
-    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))  # ✅ 强制x轴整数刻度
-
+    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "loss_curve.png"), bbox_inches="tight")
     plt.close()
-
-    # ---- Acc ----
-    # tr_acc = moving_average(df["train_acc"].to_numpy(), smooth)
-    # va_acc = moving_average(df["val_acc"].to_numpy(), smooth)
 
     tr_acc = df["train_acc"].to_numpy()
     va_acc = df["val_acc"].to_numpy()
 
     plt.figure()
-    # plt.plot(e, tr_acc, marker="o", label="Train Acc")
-    # plt.plot(e, va_acc, marker="s", label="Val Acc")
-
     plt.plot(e, tr_acc, label="Train Acc")
     plt.plot(e, va_acc, label="Val Acc")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
     plt.title("Training / Validation Accuracy")
     plt.legend()
-
-    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))  # ✅ 强制x轴整数刻度
-
+    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "acc_curve.png"), bbox_inches="tight")
     plt.close()
@@ -127,7 +111,7 @@ def plot_val_prf_curves(metrics_csv: str, out_dir: str, filename: str = "val_prf
     plt.title("Validation Macro Precision / Recall / F1")
 
     ax = plt.gca()
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))  # x 轴不出现小数
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     plt.ylim(0.0, 1.0)
 
     plt.legend()

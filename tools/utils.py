@@ -55,50 +55,29 @@ class ConsolePrinter:
 
     # ---------- Val ----------
     def val_header(self, colored=True, keep_size_placeholder=True):
-        # keep_size_placeholder=True：保留 size 占位，让 P/R/F1 与 train 的 size 列对齐
-        if keep_size_placeholder:
-            s = (
-                f"{'':<{self.W_EPOCH}}{self.SEP}"
-                f"{'loss':>{self.W_LOSS}}{self.SEP}"
-                f"{'Acc':>{self.W_ACC}}{self.SEP}"
-                f"{'':>{self.W_SIZE}}{self.SEP}"
-                f"{'P':>{self.W_PRF}}{self.SEP}"
-                f"{'R':>{self.W_PRF}}{self.SEP}"
-                f"{'F1':>{self.W_PRF}}"
-            )
-        else:
-            # 更紧凑：不留 size 占位，P/R/F1 更靠近 loss/acc（你之前问"为什么离得远"就是这个）
-            s = (
-                f"{'':<{self.W_EPOCH}}{self.SEP}"
-                f"{'loss':>{self.W_LOSS}}{self.SEP}"
-                f"{'Acc':>{self.W_ACC}}{self.SEP}"
-                f"{'P':>{self.W_PRF}}{self.SEP}"
-                f"{'R':>{self.W_PRF}}{self.SEP}"
-                f"{'F1':>{self.W_PRF}}"
-            )
-
+        size_col = f"{'':>{self.W_SIZE}}{self.SEP}" if keep_size_placeholder else ""
+        s = (
+            f"{'':<{self.W_EPOCH}}{self.SEP}"
+            f"{'loss':>{self.W_LOSS}}{self.SEP}"
+            f"{'Acc':>{self.W_ACC}}{self.SEP}"
+            f"{size_col}"
+            f"{'P':>{self.W_PRF}}{self.SEP}"
+            f"{'R':>{self.W_PRF}}{self.SEP}"
+            f"{'F1':>{self.W_PRF}}"
+        )
         return self.color(s, self.C_VAL) if colored else s
 
     def val_desc(self, loss, acc, p, r, f1, keep_size_placeholder=True):
-        if keep_size_placeholder:
-            return (
-                f"{'':<{self.W_EPOCH}}{self.SEP}"
-                f"{loss:>{self.W_LOSS}.3f}{self.SEP}"
-                f"{acc:>{self.W_ACC}.3f}{self.SEP}"
-                f"{'':>{self.W_SIZE}}{self.SEP}"
-                f"{p:>{self.W_PRF}.3f}{self.SEP}"
-                f"{r:>{self.W_PRF}.3f}{self.SEP}"
-                f"{f1:>{self.W_PRF}.3f}"
-            )
-        else:
-            return (
-                f"{'':<{self.W_EPOCH}}{self.SEP}"
-                f"{loss:>{self.W_LOSS}.3f}{self.SEP}"
-                f"{acc:>{self.W_ACC}.3f}{self.SEP}"
-                f"{p:>{self.W_PRF}.3f}{self.SEP}"
-                f"{r:>{self.W_PRF}.3f}{self.SEP}"
-                f"{f1:>{self.W_PRF}.3f}"
-            )
+        size_col = f"{'':>{self.W_SIZE}}{self.SEP}" if keep_size_placeholder else ""
+        return (
+            f"{'':<{self.W_EPOCH}}{self.SEP}"
+            f"{loss:>{self.W_LOSS}.3f}{self.SEP}"
+            f"{acc:>{self.W_ACC}.3f}{self.SEP}"
+            f"{size_col}"
+            f"{p:>{self.W_PRF}.3f}{self.SEP}"
+            f"{r:>{self.W_PRF}.3f}{self.SEP}"
+            f"{f1:>{self.W_PRF}.3f}"
+        )
 
 
 def read_split_data(
@@ -328,10 +307,6 @@ def evaluate(model, data_loader, device, epoch, epochs, num_classes: int, indent
         desc = printer.val_desc(avg_loss, avg_acc, mp, mr, mf, keep_size_placeholder=True)
         pbar.set_description_str(desc)
 
-    avg_loss = accu_loss.item() / (step + 1)
-    avg_acc  = accu_num.item() / sample_num
-    mp, mr, mf = _macro_prf_from_cm(cm)
-
     return avg_loss, avg_acc, float(mp.item()), float(mr.item()), float(mf.item())
 
 
@@ -340,7 +315,6 @@ def evaluate(model, data_loader, device, epoch, epochs, num_classes: int, indent
 # ============================================================
 
 import json
-import tempfile
 import numpy as np
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
@@ -626,18 +600,11 @@ def evaluate_detection(model, data_loader, device, ann_file: str, save_dir: Opti
     if not results_bbox:
         return {"mAP50": 0.0, "mAP50_95": 0.0}
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(results_bbox, f)
-        tmp_path = f.name
-
-    try:
-        coco_dt   = coco_gt.loadRes(tmp_path)
-        coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-    finally:
-        os.unlink(tmp_path)
+    coco_dt   = coco_gt.loadRes(results_bbox)
+    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -702,30 +669,18 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str, save_dir: O
 
     coco_gt = COCO(ann_file)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(results_bbox, f)
-        tmp_bbox = f.name
-    try:
-        coco_dt   = coco_gt.loadRes(tmp_bbox)
-        eval_bbox = COCOeval(coco_gt, coco_dt, "bbox")
-        eval_bbox.evaluate(); eval_bbox.accumulate(); eval_bbox.summarize()
-    finally:
-        os.unlink(tmp_bbox)
+    coco_dt   = coco_gt.loadRes(results_bbox)
+    eval_bbox = COCOeval(coco_gt, coco_dt, "bbox")
+    eval_bbox.evaluate(); eval_bbox.accumulate(); eval_bbox.summarize()
 
     eval_segm = None
     mask_mAP50, mask_mAP50_95 = 0.0, 0.0
     if results_segm:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(results_segm, f)
-            tmp_segm = f.name
-        try:
-            coco_dt   = coco_gt.loadRes(tmp_segm)
-            eval_segm = COCOeval(coco_gt, coco_dt, "segm")
-            eval_segm.evaluate(); eval_segm.accumulate(); eval_segm.summarize()
-            mask_mAP50    = float(eval_segm.stats[1])
-            mask_mAP50_95 = float(eval_segm.stats[0])
-        finally:
-            os.unlink(tmp_segm)
+        coco_dt   = coco_gt.loadRes(results_segm)
+        eval_segm = COCOeval(coco_gt, coco_dt, "segm")
+        eval_segm.evaluate(); eval_segm.accumulate(); eval_segm.summarize()
+        mask_mAP50    = float(eval_segm.stats[1])
+        mask_mAP50_95 = float(eval_segm.stats[0])
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)

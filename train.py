@@ -242,7 +242,6 @@ def main(args):
 
     # 调用函数获取新的exp文件夹和weights文件夹路径
     exp_folder, weights_folder = create_exp_folder()
-    os.makedirs(weights_folder, exist_ok=True)
 
     if args.task == "classify":
         _train_classify(args, device, exp_folder, weights_folder)
@@ -306,22 +305,19 @@ def _train_classify(args, device, exp_folder, weights_folder):
             writer = csv.writer(f)
             writer.writerow([epoch, train_loss, train_acc_value, val_loss, val_acc_value, val_p, val_r, val_f1, lr_now])
 
-        torch.save({
+        ckpt = {
             "epoch": epoch, "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
             "best_val_acc": best_val_acc, "args": vars(args),
-        }, last_ckpt_path)
+        }
+        torch.save(ckpt, last_ckpt_path)
 
         if val_acc_value > best_val_acc:
             best_val_acc = val_acc_value
             best_epoch = epoch
-            torch.save({
-                "epoch": epoch, "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
-                "best_val_acc": best_val_acc, "args": vars(args),
-            }, best_ckpt_path)
+            torch.save(ckpt, best_ckpt_path)
 
-    plot_from_metrics_csv(metrics_path, out_dir=exp_folder, smooth=3)
+    plot_from_metrics_csv(metrics_path, out_dir=exp_folder)
     plot_val_prf_curves(metrics_path, exp_folder)
 
     best_path = os.path.join(weights_folder, "best.pth")
