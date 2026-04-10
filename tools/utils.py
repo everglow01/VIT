@@ -1,11 +1,47 @@
 import os
 import sys
 import json
+import math
 import random
 
 import torch
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional
+
+import model.vit_model as vit_models
+import model.swin_model as swin_models
+
+# ============================================================
+# Shared utilities (used by train.py and predict.py)
+# ============================================================
+
+def get_model_factory(name: str):
+    """Look up model factory function by name (supports both ViT and Swin)."""
+    if name.startswith("swin_"):
+        factory = getattr(swin_models, name, None)
+    else:
+        factory = getattr(vit_models, name, None)
+    if factory is None or not callable(factory):
+        vit_names = [n for n in dir(vit_models) if n.startswith("vit_")]
+        swin_names = [n for n in dir(swin_models) if n.startswith("swin_")]
+        raise ValueError(f"Unknown model: {name}\nAvailable: {vit_names + swin_names}")
+    return factory
+
+
+def extract_state_dict(ckpt) -> dict:
+    """Extract model state_dict from either a raw dict or a training checkpoint."""
+    if isinstance(ckpt, dict):
+        if "model_state" in ckpt:
+            return ckpt["model_state"]
+        if "state_dict" in ckpt:
+            return ckpt["state_dict"]
+    return ckpt
+
+
+def make_cosine_lr(epochs: int, lrf: float):
+    """Return a cosine annealing LR lambda for LambdaLR."""
+    return lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - lrf) + lrf
+
 
 # 控制台打印参数类
 class ConsolePrinter:
@@ -202,10 +238,13 @@ def read_split_data(
 
 
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs):
-    printer = ConsolePrinter()
+def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
+                    loss_function=None, printer=None):
+    if printer is None:
+        printer = ConsolePrinter()
+    if loss_function is None:
+        loss_function = torch.nn.CrossEntropyLoss()
     model.train()
-    loss_function = torch.nn.CrossEntropyLoss()
 
     accu_loss = torch.zeros(1, device=device)
     accu_num  = torch.zeros(1, device=device)
@@ -268,10 +307,13 @@ def _macro_prf_from_cm(cm: torch.Tensor, eps: float = 1e-12):
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, epoch, epochs, num_classes: int, indent_spaces: int = 16):
-    printer = ConsolePrinter()
+def evaluate(model, data_loader, device, epoch, epochs, num_classes: int,
+             indent_spaces: int = 16, loss_function=None, printer=None):
+    if printer is None:
+        printer = ConsolePrinter()
+    if loss_function is None:
+        loss_function = torch.nn.CrossEntropyLoss()
     model.eval()
-    loss_function = torch.nn.CrossEntropyLoss()
 
     accu_loss = torch.zeros(1, device=device)
     accu_num  = torch.zeros(1, device=device)
@@ -296,16 +338,19 @@ def evaluate(model, data_loader, device, epoch, epochs, num_classes: int, indent
         loss = loss_function(pred, labels)
         accu_loss += loss
 
-        # 更新混淆矩阵（高效）
         idx = labels * num_classes + pred_classes
         cm += torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
 
         avg_loss = accu_loss.item() / (step + 1)
         avg_acc  = accu_num.item() / sample_num
-        mp, mr, mf = _macro_prf_from_cm(cm)
 
-        desc = printer.val_desc(avg_loss, avg_acc, mp, mr, mf, keep_size_placeholder=True)
+        desc = printer.val_desc(avg_loss, avg_acc, 0.0, 0.0, 0.0, keep_size_placeholder=True)
         pbar.set_description_str(desc)
+
+    # Compute final macro PRF from the full confusion matrix (avoid per-batch overhead)
+    mp, mr, mf = _macro_prf_from_cm(cm)
+    final_desc = printer.val_desc(avg_loss, avg_acc, mp, mr, mf, keep_size_placeholder=True)
+    print(final_desc)
 
     return avg_loss, avg_acc, float(mp.item()), float(mr.item()), float(mf.item())
 
@@ -628,6 +673,7 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str, save_dir: O
     If save_dir is provided, saves all detection plots plus mask_analysis.png.
     """
     model.eval()
+    coco_gt = COCO(ann_file)
     results_bbox = []
     results_segm = []
 
@@ -666,8 +712,6 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str, save_dir: O
     if not results_bbox:
         return {"box_mAP50": 0.0, "box_mAP50_95": 0.0,
                 "mask_mAP50": 0.0, "mask_mAP50_95": 0.0}
-
-    coco_gt = COCO(ann_file)
 
     coco_dt   = coco_gt.loadRes(results_bbox)
     eval_bbox = COCOeval(coco_gt, coco_dt, "bbox")

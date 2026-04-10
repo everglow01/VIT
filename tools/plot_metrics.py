@@ -30,18 +30,25 @@ def set_scientific_style():
     })
 
 
-def plot_from_metrics_csv(metrics_csv: str, out_dir: str):
+def _read_metrics_csv(metrics_csv: str) -> pd.DataFrame:
+    """Read and validate metrics CSV (cached by callers to avoid re-reading)."""
+    if not os.path.exists(metrics_csv):
+        raise FileNotFoundError(f"metrics.csv not found: {metrics_csv}")
+    return pd.read_csv(metrics_csv)
+
+
+def plot_from_metrics_csv(metrics_csv: str, out_dir: str, df: pd.DataFrame = None):
     """
     读取 metrics.csv 并在 out_dir 下输出：
       - loss_curve.png
       - acc_curve.png
-    """
-    if not os.path.exists(metrics_csv):
-        raise FileNotFoundError(f"metrics.csv not found: {metrics_csv}")
 
+    Pass a pre-read DataFrame via `df` to avoid re-reading the file.
+    """
     os.makedirs(out_dir, exist_ok=True)
 
-    df = pd.read_csv(metrics_csv)
+    if df is None:
+        df = _read_metrics_csv(metrics_csv)
     needed = {"epoch", "train_loss", "train_acc", "val_loss", "val_acc"}
     miss = needed - set(df.columns)
     if miss:
@@ -81,15 +88,17 @@ def plot_from_metrics_csv(metrics_csv: str, out_dir: str):
     plt.close()
 
 
-def plot_val_prf_curves(metrics_csv: str, out_dir: str, filename: str = "val_prf_curve.png"):
+def plot_val_prf_curves(metrics_csv: str, out_dir: str, filename: str = "val_prf_curve.png",
+                        df: pd.DataFrame = None):
     """
-    读取 metrics.csv，绘制 val_p / val_r / val_f1 三条曲线（同一张图），保存到 out_dir。
+    绘制 val_p / val_r / val_f1 三条曲线（同一张图），保存到 out_dir。
+
+    Pass a pre-read DataFrame via `df` to avoid re-reading the file.
     """
-    if not os.path.exists(metrics_csv):
-        raise FileNotFoundError(f"metrics.csv not found: {metrics_csv}")
     os.makedirs(out_dir, exist_ok=True)
 
-    df = pd.read_csv(metrics_csv)
+    if df is None:
+        df = _read_metrics_csv(metrics_csv)
     needed = {"epoch", "val_p", "val_r", "val_f1"}
     miss = needed - set(df.columns)
     if miss:
@@ -217,6 +226,4 @@ def save_confusion_matrices(model, val_loader, device, num_classes: int, exp_fol
     cm = compute_confusion_matrix(model, val_loader, device, num_classes)
 
     raw_path = os.path.join(exp_folder, "confusion_matrix.png")
-    plot_confusion_matrix(cm, None, raw_path,  normalize=False, use_index_labels=True)
-
-    return raw_path
+    plot_confusion_matrix(cm, None, raw_path, normalize=False, use_index_labels=True)

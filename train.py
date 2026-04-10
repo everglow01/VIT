@@ -1,5 +1,4 @@
 import os
-import math
 import argparse
 import json
 from tqdm import tqdm
@@ -11,8 +10,8 @@ import torch.optim.lr_scheduler as lr_scheduler
 
 
 from tools.my_dataset import build_vit_dataloaders
-from model import vit_model as vit_models
-from tools.utils import read_split_data, train_one_epoch, evaluate, ConsolePrinter  # 数据划分、单epoch训练、验证评估函数
+from tools.utils import (read_split_data, train_one_epoch, evaluate, ConsolePrinter,
+                         get_model_factory, extract_state_dict, make_cosine_lr)
 from tools.create_exp_folder import create_exp_folder
 from tools.plot_metrics import plot_from_metrics_csv, plot_val_prf_curves, save_confusion_matrices
 
@@ -90,7 +89,7 @@ def _suggest_models_by_sig(sig):
 
     cands = []
     for name, s in MODEL_SIGS.items():
-        if s["patch_size"] == ps and s["embed_dim"] == ed and s["depth"] == dp:
+        if s.get("patch_size") == ps and s.get("embed_dim") == ed and s.get("depth") == dp:
             cands.append(name)
     return cands
 
@@ -108,7 +107,7 @@ def _smart_load_weights(model, ckpt, args, device):
         if old_model is not None and hasattr(args, "model") and args.model != old_model:
             raise RuntimeError(
                 f"Checkpoint was trained with model={old_model}, "
-                f"but now you selected --model={args.model}. Please make them一致。"
+                f"but now you selected --model={args.model}. They must match."
             )
 
     # 只删除分类头（类别数一定不匹配）
@@ -179,19 +178,7 @@ def _smart_load_weights(model, ckpt, args, device):
 
 
 def build_model_and_prepare(args, device, num_classes: int):
-    import model.swin_model as swin_models
-    if _is_swin(args.model):
-        create_model = getattr(swin_models, args.model, None)
-    else:
-        create_model = getattr(vit_models, args.model, None)
-    if create_model is None or not callable(create_model):
-        # 给出可选项：只列出 vit_model 里"看起来像 ViT 工厂函数"的名字
-        candidates = [n for n in MODEL_SIGS.keys() if hasattr(vit_models, n)]
-        raise ValueError(
-            f"Unknown model: {args.model}\n"
-            f"Available candidates: {candidates}"
-        )
-
+    create_model = get_model_factory(args.model)
     model_obj = create_model(num_classes=num_classes)
     if not isinstance(model_obj, torch.nn.Module):
         raise TypeError(f"Model factory '{args.model}' must return torch.nn.Module, got {type(model_obj)}")
@@ -273,7 +260,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
 
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
-    lf = lambda x: ((1 + math.cos(x * math.pi / args.epochs)) / 2) * (1 - args.lrf) + args.lrf
+    lf = make_cosine_lr(args.epochs, args.lrf)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
     last_ckpt_path = os.path.join(weights_folder, "last.pth")
@@ -282,19 +269,22 @@ def _train_classify(args, device, exp_folder, weights_folder):
     best_epoch = -1
 
     printer = ConsolePrinter()
+    loss_function = torch.nn.CrossEntropyLoss()
     for epoch in range(args.epochs):
         print()
         print(printer.train_header(colored=True))
         train_loss, train_acc = train_one_epoch(
             model=model, optimizer=optimizer, data_loader=train_loader,
-            device=device, epoch=epoch, epochs=args.epochs
+            device=device, epoch=epoch, epochs=args.epochs,
+            loss_function=loss_function, printer=printer
         )
         scheduler.step()
 
         print(printer.val_header(colored=True))
         val_loss, val_acc, val_p, val_r, val_f1 = evaluate(
             model=model, data_loader=val_loader, device=device,
-            epoch=epoch, epochs=args.epochs, num_classes=num_classes, indent_spaces=16
+            epoch=epoch, epochs=args.epochs, num_classes=num_classes,
+            loss_function=loss_function, printer=printer
         )
 
         lr_now = optimizer.param_groups[0]["lr"]
@@ -317,11 +307,12 @@ def _train_classify(args, device, exp_folder, weights_folder):
             best_epoch = epoch
             torch.save(ckpt, best_ckpt_path)
 
-    plot_from_metrics_csv(metrics_path, out_dir=exp_folder)
-    plot_val_prf_curves(metrics_path, exp_folder)
+    import pandas as pd
+    metrics_df = pd.read_csv(metrics_path)
+    plot_from_metrics_csv(metrics_path, out_dir=exp_folder, df=metrics_df)
+    plot_val_prf_curves(metrics_path, exp_folder, df=metrics_df)
 
-    best_path = os.path.join(weights_folder, "best.pth")
-    ckpt = torch.load(best_path, map_location=device)
+    ckpt = torch.load(best_ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     save_confusion_matrices(model, val_loader, device, num_classes, exp_folder)
@@ -365,7 +356,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
 
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
-    lf = lambda x: ((1 + math.cos(x * math.pi / args.epochs)) / 2) * (1 - args.lrf) + args.lrf
+    lf = make_cosine_lr(args.epochs, args.lrf)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
     # CSV header
