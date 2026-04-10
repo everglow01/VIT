@@ -10,8 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 
 from tools.create_exp_folder import create_val_exp_folder
-import model.vit_model as vit_models
-import model.swin_model as swin_models
+from tools.utils import get_model_factory, extract_state_dict
 
 # ===== shared config =====
 IMG_SIZE = 224
@@ -150,11 +149,7 @@ def resolve_detseg_class_map(args, ckpt: Dict, num_classes: int) -> Optional[Dic
 
 def load_classify_checkpoint(weights_path: str, device: torch.device):
     ckpt = torch.load(weights_path, map_location=device)
-    if isinstance(ckpt, dict) and "model_state" in ckpt:
-        return ckpt["model_state"]
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        return ckpt["state_dict"]
-    return ckpt
+    return extract_state_dict(ckpt)
 
 
 def infer_num_classes(state_dict: Dict) -> Optional[int]:
@@ -164,10 +159,11 @@ def infer_num_classes(state_dict: Dict) -> Optional[int]:
     return None
 
 
+RESIZE_SIZE = 256
+
 def build_val_transform():
-    resize_size = int(IMG_SIZE / 224 * 256)
     return transforms.Compose([
-        transforms.Resize(resize_size),
+        transforms.Resize(RESIZE_SIZE),
         transforms.CenterCrop(IMG_SIZE),
         transforms.ToTensor(),
         transforms.Normalize(MEAN, STD),
@@ -189,7 +185,6 @@ def draw_text_on_image(img: Image.Image, text: str) -> Image.Image:
 
 @torch.no_grad()
 def predict_classify(model, img_pil: Image.Image, tfm, device: torch.device):
-    model.eval()
     x = tfm(img_pil.convert("RGB")).unsqueeze(0).to(device)
     logits = model(x)
     prob = torch.softmax(logits, dim=1)
@@ -211,12 +206,10 @@ def run_classify(args, device, exp_folder):
         else:
             raise RuntimeError("Cannot infer num_classes. Provide --class-indices or --num-classes.")
 
-    factory = getattr(swin_models, args.model_name, None) if args.model_name.startswith("swin_") \
-        else getattr(vit_models, args.model_name, None)
-    if factory is None or not callable(factory):
-        raise ValueError(f"Unknown --model-name: {args.model_name}")
+    factory = get_model_factory(args.model_name)
     model = factory(num_classes=num_classes).to(device)
     model.load_state_dict(state_dict, strict=False)
+    model.eval()
 
     tfm = build_val_transform()
     use_class_name = (class_map is not None) and (len(class_map) == num_classes)
@@ -312,8 +305,8 @@ def _run_detseg(args, device, exp_folder, model, ckpt, draw_fn):
                 f.write(f"{p}\t{name}\t{score:.4f}\t{x1:.1f}\t{y1:.1f}\t{x2:.1f}\t{y2:.1f}\n")
 
             if args.draw:
-                vis = draw_fn(img_pil.copy(), boxes, labels, scores, masks, class_map) if masks is not None \
-                    else draw_fn(img_pil.copy(), boxes, labels, scores, class_map)
+                vis = draw_fn(img_pil, boxes, labels, scores, masks, class_map) if masks is not None \
+                    else draw_fn(img_pil, boxes, labels, scores, class_map)
                 vis.save(os.path.join(img_out_dir, os.path.basename(p)))
 
     print(f"[INFO] Saved predictions to: {txt_path}")
@@ -322,14 +315,19 @@ def _run_detseg(args, device, exp_folder, model, ckpt, draw_fn):
 
 
 @torch.no_grad()
-def run_detect(args, device, exp_folder):
-    from model.detection_head import build_detection_model
+def run_detseg_task(args, device, exp_folder, task: str):
+    if task == "detect":
+        from model.detection_head import build_detection_model as build_fn
+        draw_fn = draw_boxes
+    else:
+        from model.segmentation_head import build_segmentation_model as build_fn
+        draw_fn = draw_masks
 
     num_classes = args.num_classes
     if num_classes is None:
-        raise ValueError("--num-classes is required for --task detect")
+        raise ValueError(f"--num-classes is required for --task {task}")
 
-    model = build_detection_model(
+    model = build_fn(
         backbone_name=args.model_name,
         num_classes=num_classes,
         backbone_weights="",
@@ -337,34 +335,11 @@ def run_detect(args, device, exp_folder):
     ).to(device)
 
     ckpt = torch.load(args.weights, map_location=device)
-    state = ckpt["model_state"] if "model_state" in ckpt else ckpt
+    state = extract_state_dict(ckpt)
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    _run_detseg(args, device, exp_folder, model, ckpt, draw_boxes)
-
-
-@torch.no_grad()
-def run_segment(args, device, exp_folder):
-    from model.segmentation_head import build_segmentation_model
-
-    num_classes = args.num_classes
-    if num_classes is None:
-        raise ValueError("--num-classes is required for --task segment")
-
-    model = build_segmentation_model(
-        backbone_name=args.model_name,
-        num_classes=num_classes,
-        backbone_weights="",
-        freeze_backbone=False,
-    ).to(device)
-
-    ckpt = torch.load(args.weights, map_location=device)
-    state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
-    model.eval()
-
-    _run_detseg(args, device, exp_folder, model, ckpt, draw_masks)
+    _run_detseg(args, device, exp_folder, model, ckpt, draw_fn)
 
 
 # ============================================================
@@ -380,10 +355,8 @@ def main(args):
 
     if args.task == "classify":
         run_classify(args, device, exp_folder)
-    elif args.task == "detect":
-        run_detect(args, device, exp_folder)
-    elif args.task == "segment":
-        run_segment(args, device, exp_folder)
+    elif args.task in ("detect", "segment"):
+        run_detseg_task(args, device, exp_folder, args.task)
     else:
         raise ValueError(f"Unknown --task: {args.task}")
 
