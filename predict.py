@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 
 from tools.create_exp_folder import create_val_exp_folder
-from tools.utils import get_model_factory, extract_state_dict
+from tools.utils import get_model_factory, extract_state_dict, apply_nms
 
 # ===== shared config =====
 IMG_SIZE = 224
@@ -299,6 +299,21 @@ def _run_detseg(args, device, exp_folder, model, ckpt, draw_fn):
             if masks is not None:
                 masks = masks[keep]
 
+            if getattr(args, "nms", False) and len(boxes) > 0:
+                t_boxes  = torch.from_numpy(boxes)
+                t_scores = torch.from_numpy(scores)
+                t_labels = torch.from_numpy(labels)
+                t_masks  = torch.from_numpy(masks) if masks is not None else None
+                t_boxes, t_scores, t_labels, t_masks = apply_nms(
+                    t_boxes, t_scores, t_labels,
+                    iou_threshold=getattr(args, "nms_iou", 0.5),
+                    masks=t_masks,
+                )
+                boxes  = t_boxes.numpy()
+                scores = t_scores.numpy()
+                labels = t_labels.numpy()
+                masks  = t_masks.numpy() if t_masks is not None else None
+
             for box, label, score in zip(boxes, labels, scores):
                 x1, y1, x2, y2 = box
                 name = class_map.get(int(label), str(label)) if class_map else str(label)
@@ -342,6 +357,43 @@ def run_detseg_task(args, device, exp_folder, task: str):
     _run_detseg(args, device, exp_folder, model, ckpt, draw_fn)
 
 
+@torch.no_grad()
+def run_detr_task(args, device, exp_folder, task: str):
+    """Inference for DETR-style detection / segmentation."""
+    from model.swin_detr import build_detr_model
+
+    num_classes = args.num_classes
+    if num_classes is None:
+        raise ValueError(f"--num-classes is required for --task {task}")
+
+    ckpt = torch.load(args.weights, map_location=device)
+    old_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+
+    # Backbone name is stored under "model" key in the checkpoint (from args.model).
+    # Fall back to args.model_name if running against a checkpoint that lacks args.
+    backbone_name = old_args.get("model", args.model_name)
+
+    model = build_detr_model(
+        backbone_name=backbone_name,
+        num_classes=num_classes,
+        task=task,
+        backbone_weights="",
+        freeze_backbone=False,
+        d_model=old_args.get("d_model", 256),
+        num_encoder_layers=old_args.get("num_enc_layers", 4),
+        num_decoder_layers=old_args.get("num_dec_layers", 4),
+        num_queries=old_args.get("num_queries", 100),
+        num_dn_groups=old_args.get("num_dn_groups", 2),
+    ).to(device)
+
+    state = extract_state_dict(ckpt)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    draw_fn = draw_masks if task == "segment" else draw_boxes
+    _run_detseg(args, device, exp_folder, model, ckpt, draw_fn)
+
+
 # ============================================================
 # Entry point
 # ============================================================
@@ -357,6 +409,10 @@ def main(args):
         run_classify(args, device, exp_folder)
     elif args.task in ("detect", "segment"):
         run_detseg_task(args, device, exp_folder, args.task)
+    elif args.task == "detr_detect":
+        run_detr_task(args, device, exp_folder, task="detect")
+    elif args.task == "detr_segment":
+        run_detr_task(args, device, exp_folder, task="segment")
     else:
         raise ValueError(f"Unknown --task: {args.task}")
 
@@ -365,13 +421,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument("--task", type=str, default="segment",
-                        choices=["classify", "detect", "segment"])
+    parser.add_argument("--task", type=str, default="detr_segment",
+                        choices=["classify", "detect", "segment", "detr_detect", "detr_segment"])
 
     # ---- common ----
-    parser.add_argument("--data",       type=str, default="data/TOMATO.v7i.coco-segmentation/images/train")
-    parser.add_argument("--weights",    type=str, default="run/train/exp26/weights/last.pth")
-    parser.add_argument("--model-name", type=str, default="swin_small_patch4_window7_224",
+    parser.add_argument("--data",       type=str, default="data/TOMATO.v7i.coco-segmentation/images/valid")
+    parser.add_argument("--weights",    type=str, default="run/train/exp33/weights/best.pth")
+    parser.add_argument("--model-name", type=str, default="swin_base_patch4_window7_224",
                         help="Backbone name used during training. "
                              "ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k. "
                              "Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224")
@@ -384,6 +440,12 @@ if __name__ == "__main__":
                         help="Required for detect/segment; optional for classify")
     parser.add_argument("--ann-file", type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_valid_fixed.json",
                         help="Optional COCO annotation JSON for detect/segment class names")
+
+    # ---- NMS (optional post-processing) ----
+    parser.add_argument("--nms", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply per-class NMS after confidence filtering (default: off)")
+    parser.add_argument("--nms-iou", type=float, default=0.5,
+                        help="IoU threshold for NMS (default: 0.5)")
 
     # ---- classify only ----
     parser.add_argument("--class-indices", type=str, default="run/train/exp/class_indices.json")
