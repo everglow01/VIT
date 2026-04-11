@@ -235,8 +235,15 @@ def main(args):
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # 调用函数获取新的exp文件夹和weights文件夹路径
-    exp_folder, weights_folder = create_exp_folder()
+    # 续训：从 checkpoint 路径推断原有 exp 目录，不创建新文件夹
+    # 新训：自动创建下一个 expN 文件夹
+    if getattr(args, 'resume', ''):
+        resume_abs    = os.path.abspath(args.resume)
+        weights_folder = os.path.dirname(resume_abs)           # .../expN/weights/
+        exp_folder     = os.path.dirname(weights_folder)       # .../expN/
+        print(f"[Resume] Continuing in existing exp folder: {exp_folder}")
+    else:
+        exp_folder, weights_folder = create_exp_folder()
 
     if args.task == "classify":
         _train_classify(args, device, exp_folder, weights_folder)
@@ -335,6 +342,45 @@ def _train_classify(args, device, exp_folder, weights_folder):
     print(f"Best checkpoint: {best_ckpt_path}")
 
 
+def _load_resume_ckpt(resume_path, model, optimizer, scheduler, device, args):
+    """
+    从断点 checkpoint 中恢复模型、优化器和调度器状态。
+
+    返回 (start_epoch, best_metric, best_epoch)。
+
+    注意：--epochs 是绝对目标轮数，而非"还要训几轮"。
+    例如：断点在 epoch 80，--epochs 150 → 继续训练 80→150 共 70 轮。
+    若 start_epoch >= args.epochs，说明已训练完毕，需手动增大 --epochs。
+    """
+    if not os.path.isfile(resume_path):
+        raise FileNotFoundError(f"[Resume] checkpoint not found: {resume_path}")
+
+    print(f"[Resume] Loading checkpoint: {resume_path}")
+    ckpt = torch.load(resume_path, map_location=device)
+
+    # 恢复模型权重
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    # 恢复优化器状态（含 Adam/AdamW 的 moment 估计）
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    # 恢复调度器状态，LR 从断点自然延续，无需手动调整
+    scheduler.load_state_dict(ckpt["scheduler_state"])
+
+    start_epoch = int(ckpt["epoch"]) + 1
+    best_metric = float(ckpt.get("best_metric", -1.0))
+    best_epoch  = int(ckpt.get("best_epoch",   -1))
+
+    print(f"[Resume] Resuming from epoch {start_epoch} / {args.epochs}  "
+          f"(best_metric={best_metric:.4f} at epoch {best_epoch})")
+
+    if start_epoch >= args.epochs:
+        raise ValueError(
+            f"[Resume] start_epoch={start_epoch} >= --epochs={args.epochs}. "
+            f"Training is already complete. Increase --epochs to continue."
+        )
+
+    return start_epoch, best_metric, best_epoch
+
+
 def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     (build_coco_dataloaders, evaluate_detection, evaluate_segmentation,
      build_detection_model, build_segmentation_model) = _import_det_seg()
@@ -377,8 +423,10 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         header = ["epoch", "train_loss", "mAP50", "mAP50_95", "lr"]
     else:
         header = ["epoch", "train_loss", "box_mAP50", "box_mAP50_95", "mask_mAP50", "mask_mAP50_95", "lr"]
-    with open(metrics_path, "w", newline="") as f:
-        csv.writer(f).writerow(header)
+    # 续训时 CSV 已存在，追加数据行，不重复写表头；新训始终重建文件
+    if not (getattr(args, 'resume', '') and os.path.exists(metrics_path)):
+        with open(metrics_path, "w", newline="") as f:
+            csv.writer(f).writerow(header)
 
     last_ckpt_path = os.path.join(weights_folder, "last.pth")
     best_ckpt_path = os.path.join(weights_folder, "best.pth")
@@ -386,8 +434,14 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     best_epoch = -1
     eval_interval = max(1, int(args.eval_interval))
 
+    # 续训：恢复模型/优化器/调度器状态，LR 自动从断点延续
+    start_epoch = 0
+    if getattr(args, 'resume', ''):
+        start_epoch, best_metric, best_epoch = _load_resume_ckpt(
+            args.resume, model, optimizer, scheduler, device, args)
+
     printer = ConsolePrinter()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
         n_batches = 0
@@ -469,15 +523,19 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
                     csv.writer(f).writerow([epoch, avg_loss, "", "", "", "", lr_now])
                 primary = None
 
-        ckpt = {
-            "epoch": epoch, "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
-            "args": vars(args),
-        }
-        torch.save(ckpt, last_ckpt_path)
         if (primary is not None) and (primary > best_metric):
             best_metric = primary
             best_epoch = epoch
+
+        # best_metric/best_epoch 写入 checkpoint，供续训时恢复
+        ckpt = {
+            "epoch": epoch, "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
+            "best_metric": best_metric, "best_epoch": best_epoch,
+            "args": vars(args),
+        }
+        torch.save(ckpt, last_ckpt_path)
+        if epoch == best_epoch:
             torch.save(ckpt, best_ckpt_path)
 
     print(f"Training done. Best metric={best_metric:.4f} at epoch={best_epoch}")
@@ -534,8 +592,10 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
                   "loss_mask", "loss_dice",
                   "box_mAP50", "box_mAP50_95", "mask_mAP50", "mask_mAP50_95", "lr"]
     metrics_path = os.path.join(exp_folder, "metrics.csv")
-    with open(metrics_path, "w", newline="") as f:
-        csv.writer(f).writerow(header)
+    # 续训时 CSV 已存在，追加数据行，不重复写表头；新训始终重建文件
+    if not (getattr(args, 'resume', '') and os.path.exists(metrics_path)):
+        with open(metrics_path, "w", newline="") as f:
+            csv.writer(f).writerow(header)
 
     last_ckpt_path = os.path.join(weights_folder, "last.pth")
     best_ckpt_path = os.path.join(weights_folder, "best.pth")
@@ -543,8 +603,14 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
     best_epoch = -1
     eval_interval = max(1, int(args.eval_interval))
 
+    # 续训：恢复模型/优化器/调度器状态，LR 自动从断点延续
+    start_epoch = 0
+    if getattr(args, 'resume', ''):
+        start_epoch, best_metric, best_epoch = _load_resume_ckpt(
+            args.resume, model, optimizer, scheduler, device, args)
+
     printer = ConsolePrinter()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
         total_ce = 0.0
@@ -655,15 +721,19 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
                     ])
                 primary = None
 
-        ckpt = {
-            "epoch": epoch, "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
-            "args": vars(args),
-        }
-        torch.save(ckpt, last_ckpt_path)
         if (primary is not None) and (primary > best_metric):
             best_metric = primary
             best_epoch = epoch
+
+        # best_metric/best_epoch 写入 checkpoint，供续训时恢复
+        ckpt = {
+            "epoch": epoch, "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
+            "best_metric": best_metric, "best_epoch": best_epoch,
+            "args": vars(args),
+        }
+        torch.save(ckpt, last_ckpt_path)
+        if epoch == best_epoch:
             torch.save(ckpt, best_ckpt_path)
 
     print(f"Training done. Best metric={best_metric:.4f} at epoch={best_epoch}")
@@ -712,6 +782,14 @@ if __name__ == '__main__':
     parser.add_argument('--device',     type=str,   default='cuda:0')
     parser.add_argument('--eval-interval', type=int, default=1,
                         help='[detect/segment] Run evaluation every N epochs (last epoch is always evaluated)')
+
+    # ---- resume (detect / segment / detr_detect / detr_segment only) ----
+    parser.add_argument('--resume', type=str, default='',
+                        help='Path to a checkpoint (.pth/.pt) to resume training from. '
+                             'Example: run/train/exp33/weights/last.pth  '
+                             'The exp folder is inferred automatically from the path. '
+                             '--epochs is the *total* target (not additional epochs). '
+                             'Not supported for --task classify.')
 
     # ---- classify only ----
     parser.add_argument('--data-path',  type=str,   default="Plant_Leaf_Disease",
