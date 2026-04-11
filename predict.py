@@ -16,7 +16,7 @@ from tools.utils import get_model_factory, extract_state_dict, apply_nms
 IMG_SIZE = 224
 MEAN = (0.5, 0.5, 0.5)
 STD  = (0.5, 0.5, 0.5)
-CONF_THRESH = 0.4
+CONF_THRESH = 0.65
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp",
             ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
 

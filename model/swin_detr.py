@@ -228,7 +228,7 @@ class SwinDETR(nn.Module):
         for b in range(B):
             probs = pred_logits[b].softmax(-1)     # [nq, C+1]
             scores, labels = probs[:, :-1].max(-1) # exclude background column
-            keep = scores > 0.5
+            keep = scores > 0.5 # confidence threshold (tune as needed)如果需要更高的召回率，可以降低这个阈值；如果需要更高的精确率，可以提高这个阈值。
             keeps.append(keep)
 
             s = scores[keep]
