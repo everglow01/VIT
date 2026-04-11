@@ -227,3 +227,86 @@ def save_confusion_matrices(model, val_loader, device, num_classes: int, exp_fol
 
     raw_path = os.path.join(exp_folder, "confusion_matrix.png")
     plot_confusion_matrix(cm, None, raw_path, normalize=False, use_index_labels=True)
+
+
+def plot_detr_metrics(metrics_csv: str, out_dir: str):
+    """
+    为 DETR 训练结果绘图，支持 detect 和 segment 两种 CSV 格式。
+
+    detect  列: epoch, loss_total, loss_ce, loss_bbox, loss_giou, mAP50, mAP50_95, lr
+    segment 列: epoch, loss_total, loss_ce, loss_bbox, loss_giou,
+                loss_mask, loss_dice, box_mAP50, box_mAP50_95, mask_mAP50, mask_mAP50_95, lr
+
+    输出到 out_dir:
+      - detr_loss_curve.png   — 各分量 loss 随 epoch 变化
+      - detr_map_curve.png    — mAP50 / mAP50_95 随 epoch 变化
+    """
+    if not os.path.exists(metrics_csv):
+        print(f"[plot_detr_metrics] metrics.csv not found: {metrics_csv}, skipping.")
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    df = pd.read_csv(metrics_csv)
+    set_scientific_style()
+
+    e = df["epoch"].to_numpy()
+
+    # ---- Loss curves ----
+    loss_cols = [c for c in ["loss_total", "loss_ce", "loss_bbox", "loss_giou",
+                              "loss_mask", "loss_dice"] if c in df.columns]
+    markers = ["o", "s", "^", "D", "v", "P"]
+    labels  = {
+        "loss_total": "Total",
+        "loss_ce":    "CE",
+        "loss_bbox":  "BBox (L1)",
+        "loss_giou":  "GIoU",
+        "loss_mask":  "Mask (BCE)",
+        "loss_dice":  "Dice",
+    }
+
+    fig, ax = plt.subplots()
+    for col, mk in zip(loss_cols, markers):
+        vals = pd.to_numeric(df[col], errors="coerce").to_numpy()
+        valid = ~np.isnan(vals)
+        if valid.any():
+            ax.plot(e[valid], vals[valid], marker=mk, label=labels.get(col, col))
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("DETR Training Loss")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "detr_loss_curve.png"), bbox_inches="tight")
+    plt.close(fig)
+
+    # ---- mAP curves ----
+    # Detect format
+    map_pairs = []
+    if "mAP50" in df.columns:
+        map_pairs.append(("mAP50",      "mAP@50",      "o",  "tab:blue"))
+        map_pairs.append(("mAP50_95",   "mAP@50:95",   "s",  "tab:orange"))
+    # Segment format
+    if "box_mAP50" in df.columns:
+        map_pairs.append(("box_mAP50",      "Box mAP@50",      "o",  "tab:blue"))
+        map_pairs.append(("box_mAP50_95",   "Box mAP@50:95",   "s",  "tab:cyan"))
+        map_pairs.append(("mask_mAP50",     "Mask mAP@50",     "^",  "tab:orange"))
+        map_pairs.append(("mask_mAP50_95",  "Mask mAP@50:95",  "D",  "tab:red"))
+
+    if map_pairs:
+        fig, ax = plt.subplots()
+        for col, lbl, mk, clr in map_pairs:
+            if col not in df.columns:
+                continue
+            vals = pd.to_numeric(df[col], errors="coerce").to_numpy()
+            valid = ~np.isnan(vals)
+            if valid.any():
+                ax.plot(e[valid], vals[valid], marker=mk, color=clr, label=lbl)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("mAP")
+        ax.set_title("DETR Validation mAP")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.set_ylim(bottom=0.0)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "detr_map_curve.png"), bbox_inches="tight")
+        plt.close(fig)
