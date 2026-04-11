@@ -25,6 +25,14 @@ def _import_det_seg():
             build_detection_model, build_segmentation_model)
 
 
+# DETR imports (only used when --task detr_detect/detr_segment)
+def _import_detr():
+    from tools.coco_dataset import build_coco_dataloaders
+    from tools.utils import evaluate_detection, evaluate_segmentation
+    from model.swin_detr import build_detr_model
+    return build_coco_dataloaders, evaluate_detection, evaluate_segmentation, build_detr_model
+
+
 # 用于"权重-模型不匹配"时给出更明确的提示（按vit_model 里的工厂函数命名）
 MODEL_SIGS = {
     "vit_base_patch16_224_in21k":  {"patch_size": 16, "embed_dim": 768,  "depth": 12},
@@ -191,7 +199,7 @@ def build_model_and_prepare(args, device, num_classes: int):
         model = _smart_load_weights(model, ckpt, args, device)
 
     # freeze：只训练 pre_logits + head
-    if args.freeze_layers:
+    if args.freeze_layers != "none":
         for name, p in model.named_parameters():
             if ("head" not in name) and ("pre_logits" not in name):
                 p.requires_grad_(False)
@@ -208,7 +216,7 @@ def main(args):
             raise ValueError("--data-path is required for --task classify")
         if not os.path.isdir(args.data_path):
             raise FileNotFoundError(f"data-path not found: {args.data_path}")
-    if args.task in ("detect", "segment"):
+    if args.task in ("detect", "segment", "detr_detect", "detr_segment"):
         required = {
             "--train-img-dir":  args.train_img_dir,
             "--train-ann-file": args.train_ann_file,
@@ -236,8 +244,12 @@ def main(args):
         _train_detect_segment(args, device, exp_folder, weights_folder, task="detect")
     elif args.task == "segment":
         _train_detect_segment(args, device, exp_folder, weights_folder, task="segment")
+    elif args.task == "detr_detect":
+        _train_detr(args, device, exp_folder, weights_folder, task="detect")
+    elif args.task == "detr_segment":
+        _train_detr(args, device, exp_folder, weights_folder, task="segment")
     else:
-        raise ValueError(f"Unknown --task: {args.task}. Choose from: classify, detect, segment")
+        raise ValueError(f"Unknown --task: {args.task}. Choose from: classify, detect, segment, detr_detect, detr_segment")
 
 
 def _train_classify(args, device, exp_folder, weights_folder):
@@ -343,14 +355,14 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
             backbone_name=args.model,
             num_classes=num_classes,
             backbone_weights=args.weights,
-            freeze_backbone=args.freeze_layers,
+            freeze_backbone=(args.freeze_layers != "none"),
         )
     else:
         model = build_segmentation_model(
             backbone_name=args.model,
             num_classes=num_classes,
             backbone_weights=args.weights,
-            freeze_backbone=args.freeze_layers,
+            freeze_backbone=(args.freeze_layers != "none"),
         )
     model.to(device)
 
@@ -475,27 +487,228 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
              f"Recommended: 1e-4 ~ 5e-4.")
 
 
+def _train_detr(args, device, exp_folder, weights_folder, task: str):
+    """Training loop for DETR-style detection / segmentation."""
+    (build_coco_dataloaders, evaluate_detection, evaluate_segmentation,
+     build_detr_model) = _import_detr()
+
+    load_masks = (task == "segment")
+    train_loader, val_loader, num_classes = build_coco_dataloaders(
+        train_img_dir=args.train_img_dir,
+        train_ann_file=args.train_ann_file,
+        val_img_dir=args.val_img_dir,
+        val_ann_file=args.val_ann_file,
+        batch_size=args.batch_size,
+        load_masks=load_masks,
+    )
+    print(f"[INFO] COCO dataset: {num_classes} foreground classes (DETR {task}).")
+
+    model = build_detr_model(
+        backbone_name=args.model,
+        num_classes=num_classes,
+        task=task,
+        backbone_weights=args.weights,
+        freeze_backbone=args.freeze_layers,
+        d_model=args.d_model,
+        nhead=8,
+        num_encoder_layers=args.num_enc_layers,
+        num_decoder_layers=args.num_dec_layers,
+        num_queries=args.num_queries,
+        num_dn_groups=args.num_dn_groups,
+        cost_class=args.cost_class,
+        cost_bbox=args.cost_bbox,
+        cost_giou=args.cost_giou,
+    )
+    model.to(device)
+
+    pg = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
+    lf = make_cosine_lr(args.epochs, args.lrf)
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+
+    # CSV header
+    if task == "detect":
+        header = ["epoch", "loss_total", "loss_ce", "loss_bbox", "loss_giou", "mAP50", "mAP50_95", "lr"]
+    else:
+        header = ["epoch", "loss_total", "loss_ce", "loss_bbox", "loss_giou",
+                  "loss_mask", "loss_dice",
+                  "box_mAP50", "box_mAP50_95", "mask_mAP50", "mask_mAP50_95", "lr"]
+    metrics_path = os.path.join(exp_folder, "metrics.csv")
+    with open(metrics_path, "w", newline="") as f:
+        csv.writer(f).writerow(header)
+
+    last_ckpt_path = os.path.join(weights_folder, "last.pth")
+    best_ckpt_path = os.path.join(weights_folder, "best.pth")
+    best_metric = -1.0
+    best_epoch = -1
+    eval_interval = max(1, int(args.eval_interval))
+
+    printer = ConsolePrinter()
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+        total_ce = 0.0
+        total_bbox = 0.0
+        total_giou = 0.0
+        total_mask = 0.0
+        total_dice = 0.0
+        n_batches = 0
+
+        print()
+        print(printer.train_header(colored=True))
+        print(f"[Train][epoch {epoch+1}/{args.epochs}] total_batches={len(train_loader)}")
+
+        pbar = tqdm(
+            train_loader,
+            dynamic_ncols=True,
+            bar_format=printer.BAR_FORMAT,
+            leave=True,
+        )
+        for images, targets in pbar:
+            img_size = int(images[0].shape[-1]) if images else 0
+            images  = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            loss_dict = model(images, targets)
+            loss = loss_dict["loss_total"]
+
+            if not torch.isfinite(loss):
+                print(f"\nWARNING: non-finite loss at epoch {epoch+1}, skipping batch: {loss}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(pg, max_norm=0.1)
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_ce   += loss_dict["loss_ce"].item()
+            total_bbox += loss_dict["loss_bbox"].item()
+            total_giou += loss_dict["loss_giou"].item()
+            if "loss_mask" in loss_dict:
+                total_mask += loss_dict["loss_mask"].item()
+                total_dice += loss_dict["loss_dice"].item()
+            n_batches += 1
+
+            avg_loss = total_loss / n_batches
+            desc = printer.train_desc(epoch + 1, args.epochs, avg_loss, 0.0, img_size)
+            pbar.set_description_str(desc)
+
+        scheduler.step()
+        avg = lambda x: x / max(n_batches, 1)
+        lr_now = optimizer.param_groups[0]["lr"]
+
+        do_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == args.epochs)
+
+        if task == "detect":
+            if do_eval:
+                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running DETR detection evaluation...")
+                is_last = (epoch + 1) == args.epochs
+                metrics = evaluate_detection(model, val_loader, device, ann_file=args.val_ann_file,
+                                             save_dir=exp_folder if is_last else None)
+                map50    = metrics["mAP50"]
+                map50_95 = metrics["mAP50_95"]
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  "
+                      f"ce={avg(total_ce):.4f} bbox={avg(total_bbox):.4f} giou={avg(total_giou):.4f}  "
+                      f"mAP50={map50:.4f}  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
+                        map50, map50_95, lr_now,
+                    ])
+                primary = map50
+            else:
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  eval=skipped  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
+                        "", "", lr_now,
+                    ])
+                primary = None
+        else:  # segment
+            if do_eval:
+                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running DETR segmentation evaluation...")
+                is_last = (epoch + 1) == args.epochs
+                metrics = evaluate_segmentation(model, val_loader, device, ann_file=args.val_ann_file,
+                                                save_dir=exp_folder if is_last else None)
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  "
+                      f"box_mAP50={metrics['box_mAP50']:.4f}  box_mAP50_95={metrics['box_mAP50_95']:.4f}  "
+                      f"mask_mAP50={metrics['mask_mAP50']:.4f}  mask_mAP50_95={metrics['mask_mAP50_95']:.4f}  "
+                      f"lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
+                        avg(total_mask), avg(total_dice),
+                        metrics["box_mAP50"], metrics["box_mAP50_95"],
+                        metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now,
+                    ])
+                # Use box_mAP50 + mask_mAP50 so best.pth tracks progress even when mask AP = 0
+                primary = metrics["box_mAP50"] + metrics["mask_mAP50"]
+            else:
+                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  eval=skipped  lr={lr_now:.6f}")
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
+                        avg(total_mask), avg(total_dice),
+                        "", "", "", "", lr_now,
+                    ])
+                primary = None
+
+        ckpt = {
+            "epoch": epoch, "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
+            "args": vars(args),
+        }
+        torch.save(ckpt, last_ckpt_path)
+        if (primary is not None) and (primary > best_metric):
+            best_metric = primary
+            best_epoch = epoch
+            torch.save(ckpt, best_ckpt_path)
+
+    print(f"Training done. Best metric={best_metric:.4f} at epoch={best_epoch}")
+    print(f"Last: {last_ckpt_path}  Best: {best_ckpt_path}")
+    if args.lr > 1e-3:
+        print(f"[WARN] --lr={args.lr} may be too large for AdamW DETR. "
+              f"Recommended: 1e-4 ~ 5e-4.")
+
+    from tools.plot_metrics import plot_detr_metrics
+    plot_detr_metrics(metrics_path, exp_folder)
+    print(f"[INFO] DETR plots saved to {exp_folder}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # ---- task ----
     parser.add_argument('--task', type=str, default='segment',
-                        choices=['classify', 'detect', 'segment'],
-                        help='Task type: classify | detect | segment')
+                        choices=['classify', 'detect', 'segment', 'detr_detect', 'detr_segment'],
+                        help='Task type: classify | detect | segment | detr_detect | detr_segment')
 
     # ---- common ----
     parser.add_argument('--epochs',     type=int,   default=100)
     parser.add_argument('--batch-size', type=int,   default=4)
     parser.add_argument('--lr',         type=float, default=0.001,
                         help='Learning rate. Recommended: 0.001 for detection/segmentation with AdamW; 0.01 for classification with SGD.')
-    parser.add_argument('--lrf',        type=float, default=0.01)
-    parser.add_argument('--model',      type=str,   default="swin_small_patch4_window7_224",
+    parser.add_argument('--lrf',        type=float, default=0.1)
+    parser.add_argument('--model',      type=str,   default="swin_base_patch4_window7_224",
                         help='Backbone name. ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k | vit_huge_patch14_224_in21k. '
                              'Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224')
-    parser.add_argument('--weights',    type=str,   default='weights/swin_small_patch4_window7_224.pth',
+    parser.add_argument('--weights',    type=str,   default='weights/swin_base_patch4_window7_224_22k.pth',
                         help='Pretrained backbone weights path; pass empty string to skip')
-    parser.add_argument('--freeze-layers', type=lambda x: x.lower() == 'true', default=True,
-                        help='Freeze backbone layers. Pass True or False. Example: --freeze-layers False')
+    def _parse_freeze(x):
+        v = x.lower()
+        if v in ("true", "all"):    return "all"
+        if v in ("false", "none"):  return "none"
+        if v == "partial":          return "partial"
+        raise argparse.ArgumentTypeError(
+            f"--freeze-layers: expected all/partial/none (or True/False), got '{x}'")
+    parser.add_argument('--freeze-layers', type=_parse_freeze, default="partial",
+                        help='Freeze backbone layers. '
+                             'all: freeze everything (default); '
+                             'partial: freeze stage0+1, unfreeze stage2+3 (DETR only); '
+                             'none: train full backbone. '
+                             'Example: --freeze-layers partial')
     parser.add_argument('--device',     type=str,   default='cuda:0')
     parser.add_argument('--eval-interval', type=int, default=1,
                         help='[detect/segment] Run evaluation every N epochs (last epoch is always evaluated)')
@@ -513,6 +726,24 @@ if __name__ == '__main__':
                         help='[detect/segment] Validation images directory')
     parser.add_argument('--val-ann-file',   type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_valid_fixed.json",
                         help='[detect/segment] Validation COCO annotation JSON')
+
+    # ---- DETR only (ignored by other tasks) ----
+    parser.add_argument('--num-queries',    type=int,   default=100,
+                        help='[detr] Number of object queries')
+    parser.add_argument('--d-model',        type=int,   default=256,
+                        help='[detr] Transformer hidden dimension')
+    parser.add_argument('--num-enc-layers', type=int,   default=4,
+                        help='[detr] Encoder layers')
+    parser.add_argument('--num-dec-layers', type=int,   default=4,
+                        help='[detr] Decoder layers')
+    parser.add_argument('--num-dn-groups',  type=int,   default=2,
+                        help='[detr] Number of DN denoising groups')
+    parser.add_argument('--cost-class',     type=float, default=1.0,
+                        help='[detr] Matching cost weight: classification')
+    parser.add_argument('--cost-bbox',      type=float, default=5.0,
+                        help='[detr] Matching cost weight: L1 bbox')
+    parser.add_argument('--cost-giou',      type=float, default=2.0,
+                        help='[detr] Matching cost weight: GIoU')
 
     opt = parser.parse_args()
     main(opt)
