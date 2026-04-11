@@ -743,3 +743,45 @@ def evaluate_segmentation(model, data_loader, device, ann_file: str, save_dir: O
         "mask_mAP50":    mask_mAP50,
         "mask_mAP50_95": mask_mAP50_95,
     }
+
+
+# ============================================================
+# NMS post-processing (optional, for DETR / detection outputs)
+# ============================================================
+
+def apply_nms(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    iou_threshold: float = 0.5,
+    masks: Optional[torch.Tensor] = None,
+):
+    """
+    Per-class NMS over detection results.
+
+    Args:
+        boxes:         [N, 4] float, xyxy format (absolute pixel coords)
+        scores:        [N]    float, confidence scores
+        labels:        [N]    int,   predicted class labels (1-based)
+        iou_threshold: IoU threshold for suppression (default 0.5)
+        masks:         [N, 1, H, W] optional, suppressed in sync with boxes
+
+    Returns:
+        (boxes, scores, labels, masks)  — all filtered to kept indices.
+        masks is None if it was None on input.
+    """
+    from torchvision.ops import batched_nms
+
+    if boxes.numel() == 0:
+        return boxes, scores, labels, masks
+
+    keep = batched_nms(
+        boxes.float(),
+        scores.float(),
+        labels,          # class-aware: boxes of different classes do not suppress each other
+        iou_threshold,
+    )
+
+    filtered_masks = masks[keep] if masks is not None else None
+    return boxes[keep], scores[keep], labels[keep], filtered_masks
+    
