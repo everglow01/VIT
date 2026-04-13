@@ -2,9 +2,11 @@ import os
 import sys
 import json
 import math
+import copy
 import random
 
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional
 
@@ -126,6 +128,57 @@ def make_param_groups(
         f"@ lr={bb_lr_str}  (weight_decay={weight_decay})"
     )
     return groups
+
+
+class ModelEMA:
+    """Exponential Moving Average (EMA) of model weights.
+
+    Maintains a shadow copy of model parameters updated each step as:
+        shadow_w = d * shadow_w + (1 - d) * model_w
+
+    The effective decay *d* is warmed up during the first few hundred steps:
+        d = min(decay, (1 + n) / (10 + n))
+    so that early, poorly-optimised weights do not pollute the shadow copy.
+
+    Usage::
+        ema = ModelEMA(model, decay=0.9999)
+        # inside training loop, after optimizer.step():
+        ema.update(model)
+        # for evaluation:
+        with torch.no_grad():
+            preds = ema.ema(inputs)
+
+    Args:
+        model : the training model (copied on init)
+        decay : EMA coefficient; 0.9999 is typical for large-batch training,
+                0.999 for small-batch / shorter runs
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.updates = 0  # step counter used for warmup
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        """Update shadow weights from the current training model."""
+        self.updates += 1
+        d = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(msd[k].detach().to(v.device) * (1.0 - d))
+
+    def state_dict(self) -> dict:
+        """Return serialisable state (shadow weights + step counter)."""
+        return {"ema": self.ema.state_dict(), "updates": self.updates}
+
+    def load_state_dict(self, state: dict):
+        """Restore from a previously saved state_dict."""
+        self.ema.load_state_dict(state["ema"])
+        self.updates = int(state.get("updates", 0))
 
 
 def make_cosine_lr(epochs: int, lrf: float, warmup_epochs: int = 0):
@@ -342,7 +395,7 @@ def read_split_data(
 
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
-                    loss_function=None, printer=None):
+                    loss_function=None, printer=None, ema=None):
     if printer is None:
         printer = ConsolePrinter()
     if loss_function is None:
@@ -372,6 +425,8 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
         loss = loss_function(pred, labels)
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
         optimizer.zero_grad()
 
         accu_loss += loss.detach()

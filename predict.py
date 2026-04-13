@@ -16,7 +16,7 @@ from tools.utils import get_model_factory, extract_state_dict, apply_nms
 IMG_SIZE = 224
 MEAN = (0.5, 0.5, 0.5)
 STD  = (0.5, 0.5, 0.5)
-CONF_THRESH = 0.65
+CONF_THRESH = 0.5
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp",
             ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
 
@@ -421,12 +421,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument("--task", type=str, default="detr_segment",
+    parser.add_argument("--task", type=str, default="segment",
                         choices=["classify", "detect", "segment", "detr_detect", "detr_segment"])
 
     # ---- common ----
     parser.add_argument("--data",       type=str, default="data/TOMATO.v7i.coco-segmentation/images/valid")
-    parser.add_argument("--weights",    type=str, default="run/train/exp33/weights/best.pth")
+    parser.add_argument("--weights",    type=str, default="run/train/exp37/weights/best.pth")
     parser.add_argument("--model-name", type=str, default="swin_base_patch4_window7_224",
                         help="Backbone name used during training. "
                              "ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k. "
@@ -444,7 +444,7 @@ if __name__ == "__main__":
     # ---- NMS (optional post-processing) ----
     parser.add_argument("--nms", action=argparse.BooleanOptionalAction, default=True,
                         help="Apply per-class NMS after confidence filtering (default: off)")
-    parser.add_argument("--nms-iou", type=float, default=0.5,
+    parser.add_argument("--nms-iou", type=float, default=0.8,
                         help="IoU threshold for NMS (default: 0.5)")
 
     # ---- classify only ----
