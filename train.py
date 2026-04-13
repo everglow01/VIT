@@ -11,7 +11,8 @@ import torch.optim.lr_scheduler as lr_scheduler
 
 from tools.my_dataset import build_vit_dataloaders
 from tools.utils import (read_split_data, train_one_epoch, evaluate, ConsolePrinter,
-                         get_model_factory, extract_state_dict, make_cosine_lr)
+                         get_model_factory, extract_state_dict, make_cosine_lr,
+                         make_param_groups)
 from tools.create_exp_folder import create_exp_folder
 from tools.plot_metrics import plot_from_metrics_csv, plot_val_prf_curves, save_confusion_matrices
 
@@ -277,7 +278,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
 
     model = build_model_and_prepare(args, device, num_classes)
 
-    pg = [p for p in model.parameters() if p.requires_grad]
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale)
     optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
     lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
@@ -412,7 +413,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         )
     model.to(device)
 
-    pg = [p for p in model.parameters() if p.requires_grad]
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale)
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
     lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
@@ -579,7 +580,7 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
     )
     model.to(device)
 
-    pg = [p for p in model.parameters() if p.requires_grad]
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale)
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
     lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
@@ -766,6 +767,11 @@ if __name__ == '__main__':
                              'LR rises from 0 to --lr over this many epochs. '
                              'Recommended: 5 for classify, 5 for detect/segment, 10 for detr. '
                              'Set 0 to disable.')
+    parser.add_argument('--backbone-lr-scale', type=float, default=0.1,
+                        help='LR multiplier for backbone parameters relative to head. '
+                             'backbone_lr = --lr * --backbone-lr-scale. '
+                             'Applies only when backbone is not fully frozen. '
+                             'Default 0.1 (backbone trains at 1/10 of head LR).')
     parser.add_argument('--model',      type=str,   default="swin_base_patch4_window7_224",
                         help='Backbone name. ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k | vit_huge_patch14_224_in21k. '
                              'Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224')

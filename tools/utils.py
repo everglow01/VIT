@@ -38,6 +38,58 @@ def extract_state_dict(ckpt) -> dict:
     return ckpt
 
 
+def make_param_groups(model, lr: float, backbone_lr_scale: float = 0.1):
+    """Split model parameters into backbone (lower LR) and head (full LR) groups.
+
+    Splitting logic:
+      - Models with a ``backbone`` attribute (detect / segment / DETR):
+          params whose name starts with ``backbone.`` → backbone group (lr × scale)
+          all other trainable params                  → head group    (lr)
+      - Classify models (ViT / Swin used directly, no ``backbone`` attribute):
+          params whose name contains ``head.`` or ``pre_logits.`` → head group (lr)
+          all other trainable params                               → backbone group (lr × scale)
+
+    If backbone is frozen (all backbone params have requires_grad=False), the backbone
+    group will be empty and the function transparently returns a single-group list,
+    so it is safe to call unconditionally regardless of freeze settings.
+
+    Args:
+        model             : the model whose parameters to split
+        lr                : base (head) learning rate
+        backbone_lr_scale : multiplier applied to backbone LR (default 0.1)
+
+    Returns:
+        list of param-group dicts suitable for passing directly to an optimizer
+    """
+    backbone_params, head_params = [], []
+    has_backbone_attr = hasattr(model, "backbone")
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if has_backbone_attr:
+            if name.startswith("backbone."):
+                backbone_params.append(p)
+            else:
+                head_params.append(p)
+        else:
+            if "head." in name or "pre_logits." in name:
+                head_params.append(p)
+            else:
+                backbone_params.append(p)
+
+    groups = [{"params": head_params, "lr": lr}]
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": lr * backbone_lr_scale})
+
+    n_backbone = len(backbone_params)
+    n_head     = len(head_params)
+    bb_lr_str  = f"{lr * backbone_lr_scale:.2e}" if backbone_params else "frozen"
+    print(f"[ParamGroups] head={n_head} params @ lr={lr:.2e} | "
+          f"backbone={n_backbone} params @ lr={bb_lr_str}")
+    return groups
+
+
 def make_cosine_lr(epochs: int, lrf: float, warmup_epochs: int = 0):
     """Return a cosine annealing LR lambda for LambdaLR.
 
