@@ -38,9 +38,22 @@ def extract_state_dict(ckpt) -> dict:
     return ckpt
 
 
-def make_cosine_lr(epochs: int, lrf: float):
-    """Return a cosine annealing LR lambda for LambdaLR."""
-    return lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - lrf) + lrf
+def make_cosine_lr(epochs: int, lrf: float, warmup_epochs: int = 0):
+    """Return a cosine annealing LR lambda for LambdaLR.
+
+    Args:
+        epochs       : total training epochs
+        lrf          : final LR ratio (lr_final = lr * lrf)
+        warmup_epochs: number of linear warmup epochs before cosine decay starts.
+                       During warmup, LR rises linearly from 0 to the base LR.
+                       Set to 0 to disable (original behaviour).
+    """
+    def fn(x):
+        if warmup_epochs > 0 and x < warmup_epochs:
+            return x / warmup_epochs                                    # 0 → 1 线性升
+        t = (x - warmup_epochs) / max(epochs - warmup_epochs, 1)
+        return ((1 + math.cos(t * math.pi)) / 2) * (1 - lrf) + lrf    # 余弦降
+    return fn
 
 
 # 控制台打印参数类

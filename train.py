@@ -279,7 +279,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
 
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
-    lf = make_cosine_lr(args.epochs, args.lrf)
+    lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
     last_ckpt_path = os.path.join(weights_folder, "last.pth")
@@ -414,7 +414,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
 
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
-    lf = make_cosine_lr(args.epochs, args.lrf)
+    lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
     # CSV header
@@ -581,7 +581,7 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
 
     pg = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
-    lf = make_cosine_lr(args.epochs, args.lrf)
+    lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
     # CSV header
@@ -760,7 +760,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int,   default=4)
     parser.add_argument('--lr',         type=float, default=0.001,
                         help='Learning rate. Recommended: 0.001 for detection/segmentation with AdamW; 0.01 for classification with SGD.')
-    parser.add_argument('--lrf',        type=float, default=0.1)
+    parser.add_argument('--lrf',          type=float, default=0.1)
+    parser.add_argument('--warmup-epochs', type=int,   default=5,
+                        help='Linear LR warmup epochs before cosine decay. '
+                             'LR rises from 0 to --lr over this many epochs. '
+                             'Recommended: 5 for classify, 5 for detect/segment, 10 for detr. '
+                             'Set 0 to disable.')
     parser.add_argument('--model',      type=str,   default="swin_base_patch4_window7_224",
                         help='Backbone name. ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k | vit_huge_patch14_224_in21k. '
                              'Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224')
@@ -773,7 +778,7 @@ if __name__ == '__main__':
         if v == "partial":          return "partial"
         raise argparse.ArgumentTypeError(
             f"--freeze-layers: expected all/partial/none (or True/False), got '{x}'")
-    parser.add_argument('--freeze-layers', type=_parse_freeze, default="partial",
+    parser.add_argument('--freeze-layers', type=_parse_freeze, default="none",
                         help='Freeze backbone layers. '
                              'all: freeze everything (default); '
                              'partial: freeze stage0+1, unfreeze stage2+3 (DETR only); '
