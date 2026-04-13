@@ -205,6 +205,16 @@ class SetCriterion(nn.Module):
             losses["loss_dn_bbox"] = loss_dn_bbox
             losses["loss_dn_giou"] = loss_dn_giou
 
+        # Auxiliary decoder losses (one set per intermediate decoder layer)
+        # Each layer gets independent Hungarian matching so it receives direct gradient.
+        for i, aux in enumerate(outputs.get("aux_outputs", [])):
+            aux_indices = self.matcher(aux["pred_logits"], aux["pred_boxes"], targets)
+            aux_ce = self.loss_labels(aux["pred_logits"], targets, aux_indices, num_objects)
+            aux_bbox, aux_giou = self.loss_boxes(aux["pred_boxes"], targets, aux_indices, num_objects)
+            losses[f"loss_ce_aux_{i}"]   = aux_ce
+            losses[f"loss_bbox_aux_{i}"] = aux_bbox
+            losses[f"loss_giou_aux_{i}"] = aux_giou
+
         # Weighted total
         loss_total = torch.tensor(0.0, device=pred_logits.device)
         for k, v in losses.items():

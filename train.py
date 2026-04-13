@@ -11,7 +11,8 @@ import torch.optim.lr_scheduler as lr_scheduler
 
 from tools.my_dataset import build_vit_dataloaders
 from tools.utils import (read_split_data, train_one_epoch, evaluate, ConsolePrinter,
-                         get_model_factory, extract_state_dict, make_cosine_lr)
+                         get_model_factory, extract_state_dict, make_cosine_lr,
+                         make_param_groups, ModelEMA)
 from tools.create_exp_folder import create_exp_folder
 from tools.plot_metrics import plot_from_metrics_csv, plot_val_prf_curves, save_confusion_matrices
 
@@ -277,10 +278,14 @@ def _train_classify(args, device, exp_folder, weights_folder):
 
     model = build_model_and_prepare(args, device, num_classes)
 
-    pg = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
-    lf = make_cosine_lr(args.epochs, args.lrf)
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=5e-5)
+    optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=0.0)
+    lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"[EMA] enabled, decay={args.ema_decay}")
 
     last_ckpt_path = os.path.join(weights_folder, "last.pth")
     best_ckpt_path = os.path.join(weights_folder, "best.pth")
@@ -295,13 +300,14 @@ def _train_classify(args, device, exp_folder, weights_folder):
         train_loss, train_acc = train_one_epoch(
             model=model, optimizer=optimizer, data_loader=train_loader,
             device=device, epoch=epoch, epochs=args.epochs,
-            loss_function=loss_function, printer=printer
+            loss_function=loss_function, printer=printer, ema=ema,
         )
         scheduler.step()
 
         print(printer.val_header(colored=True))
+        eval_model = ema.ema if ema is not None else model
         val_loss, val_acc, val_p, val_r, val_f1 = evaluate(
-            model=model, data_loader=val_loader, device=device,
+            model=eval_model, data_loader=val_loader, device=device,
             epoch=epoch, epochs=args.epochs, num_classes=num_classes,
             loss_function=loss_function, printer=printer
         )
@@ -316,6 +322,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
 
         ckpt = {
             "epoch": epoch, "model_state": model.state_dict(),
+            "ema_state": ema.state_dict() if ema is not None else None,
             "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
             "best_val_acc": best_val_acc, "args": vars(args),
         }
@@ -342,7 +349,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
     print(f"Best checkpoint: {best_ckpt_path}")
 
 
-def _load_resume_ckpt(resume_path, model, optimizer, scheduler, device, args):
+def _load_resume_ckpt(resume_path, model, optimizer, scheduler, device, args, ema=None):
     """
     从断点 checkpoint 中恢复模型、优化器和调度器状态。
 
@@ -364,6 +371,10 @@ def _load_resume_ckpt(resume_path, model, optimizer, scheduler, device, args):
     optimizer.load_state_dict(ckpt["optimizer_state"])
     # 恢复调度器状态，LR 从断点自然延续，无需手动调整
     scheduler.load_state_dict(ckpt["scheduler_state"])
+    # 恢复 EMA shadow weights（若存在）
+    if ema is not None and ckpt.get("ema_state") is not None:
+        ema.load_state_dict(ckpt["ema_state"])
+        print(f"[Resume] EMA restored (updates={ema.updates})")
 
     start_epoch = int(ckpt["epoch"]) + 1
     best_metric = float(ckpt.get("best_metric", -1.0))
@@ -412,10 +423,14 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         )
     model.to(device)
 
-    pg = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
-    lf = make_cosine_lr(args.epochs, args.lrf)
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=0.05)
+    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.0)
+    lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"[EMA] enabled, decay={args.ema_decay}")
 
     # CSV header
     metrics_path = os.path.join(exp_folder, "metrics.csv")
@@ -438,7 +453,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     start_epoch = 0
     if getattr(args, 'resume', ''):
         start_epoch, best_metric, best_epoch = _load_resume_ckpt(
-            args.resume, model, optimizer, scheduler, device, args)
+            args.resume, model, optimizer, scheduler, device, args, ema=ema)
 
     printer = ConsolePrinter()
     for epoch in range(start_epoch, args.epochs):
@@ -473,6 +488,8 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(pg, max_norm=1.0)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
             total_loss += loss.item()
             n_batches += 1
@@ -486,12 +503,13 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         lr_now = optimizer.param_groups[0]["lr"]
 
         do_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == args.epochs)
+        eval_model = ema.ema if ema is not None else model
 
         if task == "detect":
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running detection evaluation...")
                 is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_detection(model, val_loader, device, ann_file=args.val_ann_file,
+                metrics = evaluate_detection(eval_model, val_loader, device, ann_file=args.val_ann_file,
                                              save_dir=exp_folder if is_last else None)
                 map50    = metrics["mAP50"]
                 map50_95 = metrics["mAP50_95"]
@@ -508,7 +526,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running segmentation evaluation...")
                 is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_segmentation(model, val_loader, device, ann_file=args.val_ann_file,
+                metrics = evaluate_segmentation(eval_model, val_loader, device, ann_file=args.val_ann_file,
                                                 save_dir=exp_folder if is_last else None)
                 print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
                       f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
@@ -530,6 +548,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         # best_metric/best_epoch 写入 checkpoint，供续训时恢复
         ckpt = {
             "epoch": epoch, "model_state": model.state_dict(),
+            "ema_state": ema.state_dict() if ema is not None else None,
             "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
             "best_metric": best_metric, "best_epoch": best_epoch,
             "args": vars(args),
@@ -579,10 +598,14 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
     )
     model.to(device)
 
-    pg = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
-    lf = make_cosine_lr(args.epochs, args.lrf)
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=0.05)
+    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.0)
+    lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"[EMA] enabled, decay={args.ema_decay}")
 
     # CSV header
     if task == "detect":
@@ -607,7 +630,7 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
     start_epoch = 0
     if getattr(args, 'resume', ''):
         start_epoch, best_metric, best_epoch = _load_resume_ckpt(
-            args.resume, model, optimizer, scheduler, device, args)
+            args.resume, model, optimizer, scheduler, device, args, ema=ema)
 
     printer = ConsolePrinter()
     for epoch in range(start_epoch, args.epochs):
@@ -647,6 +670,8 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(pg, max_norm=0.1)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
             total_loss += loss.item()
             total_ce   += loss_dict["loss_ce"].item()
@@ -666,12 +691,13 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
         lr_now = optimizer.param_groups[0]["lr"]
 
         do_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == args.epochs)
+        eval_model = ema.ema if ema is not None else model
 
         if task == "detect":
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running DETR detection evaluation...")
                 is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_detection(model, val_loader, device, ann_file=args.val_ann_file,
+                metrics = evaluate_detection(eval_model, val_loader, device, ann_file=args.val_ann_file,
                                              save_dir=exp_folder if is_last else None)
                 map50    = metrics["mAP50"]
                 map50_95 = metrics["mAP50_95"]
@@ -696,7 +722,7 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
             if do_eval:
                 print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running DETR segmentation evaluation...")
                 is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_segmentation(model, val_loader, device, ann_file=args.val_ann_file,
+                metrics = evaluate_segmentation(eval_model, val_loader, device, ann_file=args.val_ann_file,
                                                 save_dir=exp_folder if is_last else None)
                 print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  "
                       f"box_mAP50={metrics['box_mAP50']:.4f}  box_mAP50_95={metrics['box_mAP50_95']:.4f}  "
@@ -728,6 +754,7 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
         # best_metric/best_epoch 写入 checkpoint，供续训时恢复
         ckpt = {
             "epoch": epoch, "model_state": model.state_dict(),
+            "ema_state": ema.state_dict() if ema is not None else None,
             "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
             "best_metric": best_metric, "best_epoch": best_epoch,
             "args": vars(args),
@@ -760,7 +787,23 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int,   default=4)
     parser.add_argument('--lr',         type=float, default=0.001,
                         help='Learning rate. Recommended: 0.001 for detection/segmentation with AdamW; 0.01 for classification with SGD.')
-    parser.add_argument('--lrf',        type=float, default=0.1)
+    parser.add_argument('--lrf',          type=float, default=0.1)
+    parser.add_argument('--warmup-epochs', type=int,   default=5,
+                        help='Linear LR warmup epochs before cosine decay. '
+                             'LR rises from 0 to --lr over this many epochs. '
+                             'Recommended: 5 for classify, 5 for detect/segment, 10 for detr. '
+                             'Set 0 to disable.')
+    parser.add_argument('--backbone-lr-scale', type=float, default=0.1,
+                        help='LR multiplier for backbone parameters relative to head. '
+                             'backbone_lr = --lr * --backbone-lr-scale. '
+                             'Applies only when backbone is not fully frozen. '
+                             'Default 0.1 (backbone trains at 1/10 of head LR).')
+    parser.add_argument('--ema-decay', type=float, default=0.9999,
+                        help='EMA decay for model weight averaging. '
+                             'shadow_w = decay * shadow_w + (1-decay) * model_w. '
+                             'EMA weights are used for evaluation and saved in checkpoints. '
+                             'Set 0 to disable EMA. '
+                             'Recommended: 0.9999 for large-batch runs, 0.999 for small-batch / short runs.')
     parser.add_argument('--model',      type=str,   default="swin_base_patch4_window7_224",
                         help='Backbone name. ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k | vit_huge_patch14_224_in21k. '
                              'Swin: swin_tiny_patch4_window7_224 | swin_small_patch4_window7_224 | swin_base_patch4_window7_224')
@@ -773,7 +816,7 @@ if __name__ == '__main__':
         if v == "partial":          return "partial"
         raise argparse.ArgumentTypeError(
             f"--freeze-layers: expected all/partial/none (or True/False), got '{x}'")
-    parser.add_argument('--freeze-layers', type=_parse_freeze, default="partial",
+    parser.add_argument('--freeze-layers', type=_parse_freeze, default="none",
                         help='Freeze backbone layers. '
                              'all: freeze everything (default); '
                              'partial: freeze stage0+1, unfreeze stage2+3 (DETR only); '

@@ -2,9 +2,11 @@ import os
 import sys
 import json
 import math
+import copy
 import random
 
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional
 
@@ -38,9 +40,163 @@ def extract_state_dict(ckpt) -> dict:
     return ckpt
 
 
-def make_cosine_lr(epochs: int, lrf: float):
-    """Return a cosine annealing LR lambda for LambdaLR."""
-    return lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - lrf) + lrf
+def _no_decay(name: str, param) -> bool:
+    """Return True if this parameter should be excluded from weight decay.
+
+    Excluded:
+      - All bias terms (name ends with '.bias')
+      - 1-D parameters: LayerNorm / BatchNorm weight+bias, embedding vectors
+    """
+    return name.endswith(".bias") or param.ndim <= 1
+
+
+def make_param_groups(
+    model,
+    lr: float,
+    backbone_lr_scale: float = 0.1,
+    weight_decay: float = 0.0,
+):
+    """Split model parameters into up to 4 groups by (role × decay).
+
+    Axes:
+      1. Role  — backbone (lr × scale) vs head (full lr)
+      2. Decay — weight matrices / conv filters get ``weight_decay``;
+                 biases and 1-D norm params get ``weight_decay=0``
+
+    Splitting logic (role):
+      - Models with a ``backbone`` attribute (detect / segment / DETR):
+          params whose name starts with ``backbone.`` → backbone group
+          all other trainable params                  → head group
+      - Classify models (ViT / Swin used directly, no ``backbone`` attribute):
+          params whose name contains ``head.`` or ``pre_logits.`` → head group
+          all other trainable params                               → backbone group
+
+    If backbone is fully frozen the backbone groups are empty and are omitted,
+    so callers can pass this list directly to any optimizer unconditionally.
+
+    Args:
+        model             : the model whose parameters to split
+        lr                : base (head) learning rate
+        backbone_lr_scale : multiplier applied to backbone LR (default 0.1)
+        weight_decay      : weight decay applied to decay-eligible params (default 0)
+
+    Returns:
+        list of param-group dicts suitable for passing directly to an optimizer.
+        Each group carries explicit ``lr`` and ``weight_decay`` keys so the
+        optimizer constructor does not need to specify them.
+    """
+    # buckets: (role, decay) → list[param]
+    buckets: dict = {
+        ("head",     True):  [],
+        ("head",     False): [],
+        ("backbone", True):  [],
+        ("backbone", False): [],
+    }
+    has_backbone_attr = hasattr(model, "backbone")
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # Determine role
+        if has_backbone_attr:
+            role = "backbone" if name.startswith("backbone.") else "head"
+        else:
+            role = "head" if ("head." in name or "pre_logits." in name) else "backbone"
+        # Determine decay eligibility
+        decay = not _no_decay(name, p)
+        buckets[(role, decay)].append(p)
+
+    groups = []
+    for (role, decay), params in buckets.items():
+        if not params:
+            continue
+        group_lr = lr if role == "head" else lr * backbone_lr_scale
+        groups.append({
+            "params":       params,
+            "lr":           group_lr,
+            "weight_decay": weight_decay if decay else 0.0,
+        })
+
+    # Summary
+    def _cnt(role, decay): return len(buckets[(role, decay)])
+    bb_lr_str = f"{lr * backbone_lr_scale:.2e}" if (
+        _cnt("backbone", True) + _cnt("backbone", False) > 0) else "frozen"
+    print(
+        f"[ParamGroups] "
+        f"head_decay={_cnt('head', True)} head_nodecay={_cnt('head', False)} @ lr={lr:.2e} | "
+        f"backbone_decay={_cnt('backbone', True)} backbone_nodecay={_cnt('backbone', False)} "
+        f"@ lr={bb_lr_str}  (weight_decay={weight_decay})"
+    )
+    return groups
+
+
+class ModelEMA:
+    """Exponential Moving Average (EMA) of model weights.
+
+    Maintains a shadow copy of model parameters updated each step as:
+        shadow_w = d * shadow_w + (1 - d) * model_w
+
+    The effective decay *d* is warmed up during the first few hundred steps:
+        d = min(decay, (1 + n) / (10 + n))
+    so that early, poorly-optimised weights do not pollute the shadow copy.
+
+    Usage::
+        ema = ModelEMA(model, decay=0.9999)
+        # inside training loop, after optimizer.step():
+        ema.update(model)
+        # for evaluation:
+        with torch.no_grad():
+            preds = ema.ema(inputs)
+
+    Args:
+        model : the training model (copied on init)
+        decay : EMA coefficient; 0.9999 is typical for large-batch training,
+                0.999 for small-batch / shorter runs
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.updates = 0  # step counter used for warmup
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        """Update shadow weights from the current training model."""
+        self.updates += 1
+        d = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(msd[k].detach().to(v.device) * (1.0 - d))
+
+    def state_dict(self) -> dict:
+        """Return serialisable state (shadow weights + step counter)."""
+        return {"ema": self.ema.state_dict(), "updates": self.updates}
+
+    def load_state_dict(self, state: dict):
+        """Restore from a previously saved state_dict."""
+        self.ema.load_state_dict(state["ema"])
+        self.updates = int(state.get("updates", 0))
+
+
+def make_cosine_lr(epochs: int, lrf: float, warmup_epochs: int = 0):
+    """Return a cosine annealing LR lambda for LambdaLR.
+
+    Args:
+        epochs       : total training epochs
+        lrf          : final LR ratio (lr_final = lr * lrf)
+        warmup_epochs: number of linear warmup epochs before cosine decay starts.
+                       During warmup, LR rises linearly from 0 to the base LR.
+                       Set to 0 to disable (original behaviour).
+    """
+    def fn(x):
+        if warmup_epochs > 0 and x < warmup_epochs:
+            return x / warmup_epochs                                    # 0 → 1 线性升
+        t = (x - warmup_epochs) / max(epochs - warmup_epochs, 1)
+        return ((1 + math.cos(t * math.pi)) / 2) * (1 - lrf) + lrf    # 余弦降
+    return fn
 
 
 # 控制台打印参数类
@@ -239,7 +395,7 @@ def read_split_data(
 
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
-                    loss_function=None, printer=None):
+                    loss_function=None, printer=None, ema=None):
     if printer is None:
         printer = ConsolePrinter()
     if loss_function is None:
@@ -269,6 +425,8 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
         loss = loss_function(pred, labels)
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
         optimizer.zero_grad()
 
         accu_loss += loss.detach()

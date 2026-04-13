@@ -128,6 +128,13 @@ class SwinDETR(nn.Module):
             weight_dict["loss_mask"] = 2.0
             weight_dict["loss_dice"] = 2.0
 
+        # Auxiliary decoder losses: one set per intermediate decoder layer.
+        # Use the same weights as the main output so every layer receives equal supervision.
+        for i in range(num_decoder_layers - 1):
+            weight_dict[f"loss_ce_aux_{i}"]   = 1.0
+            weight_dict[f"loss_bbox_aux_{i}"] = cost_bbox
+            weight_dict[f"loss_giou_aux_{i}"] = cost_giou
+
         self.criterion = SetCriterion(
             num_classes=num_classes,
             matcher=matcher,
