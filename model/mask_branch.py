@@ -6,7 +6,7 @@ mask logits at p3 resolution (H/8 × W/8 for 224 input).
 """
 import torch
 import torch.nn as nn
-from AttentionModules.DANet import DANet
+from AttentionModules import DANet
 
 
 class MaskBranch(nn.Module):

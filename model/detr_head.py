@@ -11,8 +11,7 @@ mask branch), memory (encoder output), and DN predictions when training.
 import math
 import torch
 import torch.nn as nn
-from AttentionModules.SCSA import SCSA
-from AttentionModules.DeformableAttention import DeformableAttention
+from AttentionModules import SCSA, DeformableAttention
 
 
 # ======================================================================
@@ -187,6 +186,74 @@ def prepare_dn_components(targets, num_queries, d_model, num_classes,
 
 
 # ======================================================================
+# Deformable Encoder
+# ======================================================================
+
+class DeformableEncoderLayer(nn.Module):
+    """
+    Transformer encoder layer that replaces standard self-attention with per-level
+    DeformableAttention, followed by a shared FFN.
+
+    The spatial sequence is split back into per-level (H, W) tensors for
+    DeformableAttention (which operates on (B, C, H, W)), then concatenated and
+    passed through a standard FFN with Add & Norm.
+    """
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, num_levels):
+        super().__init__()
+        # One DeformableAttention per FPN level; each already contains residual + LayerNorm
+        self.deform_attns = nn.ModuleList([
+            DeformableAttention(d_model, num_heads=nhead) for _ in range(num_levels)
+        ])
+        # FFN (Add & Norm applied after, mirroring TransformerEncoderLayer structure)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, src, spatial_shapes):
+        """
+        Args:
+            src           : [B, sum(HiWi), d_model]  concatenated multi-level tokens
+            spatial_shapes: list[(Hi, Wi)]            per-level spatial sizes
+        Returns:
+            src : [B, sum(HiWi), d_model]
+        """
+        B = src.shape[0]
+        outs = []
+        offset = 0
+        for i, (H, W) in enumerate(spatial_shapes):
+            N = H * W
+            feat = src[:, offset:offset + N]                         # [B, HW, d_model]
+            feat = feat.transpose(1, 2).view(B, -1, H, W)           # [B, C, H, W]
+            feat = self.deform_attns[i](feat)                        # [B, C, H, W]
+            outs.append(feat.flatten(2).transpose(1, 2))             # [B, HW, d_model]
+            offset += N
+        src = torch.cat(outs, dim=1)                                 # [B, sum(HiWi), d_model]
+
+        # FFN with Add & Norm
+        src2 = self.linear2(self.dropout1(self.activation(self.linear1(src))))
+        src = self.norm(src + self.dropout2(src2))
+        return src
+
+
+class DeformableTransformerEncoder(nn.Module):
+    """Stack of DeformableEncoderLayer, replaces nn.TransformerEncoder."""
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, num_layers, num_levels):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            DeformableEncoderLayer(d_model, nhead, dim_feedforward, dropout, num_levels)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, src, spatial_shapes):
+        for layer in self.layers:
+            src = layer(src, spatial_shapes)
+        return src
+
+
+# ======================================================================
 # DETRHead
 # ======================================================================
 
@@ -215,19 +282,14 @@ class DETRHead(nn.Module):
         self.num_classes = num_classes
         self.num_dn_groups = num_dn_groups
 
-        # Per-level input projection
+        # Per-level input projection (1x1 conv keeps spatial format for SCSA/DeformableAttn)
         self.input_projs = nn.ModuleList([
-            nn.Linear(c, d_model) for c in in_channels_list
+            nn.Conv2d(c, d_model, 1) for c in in_channels_list
         ])
 
         # Per-level SCSA after projection (spatial attention before encoder)
         self.scsa_levels = nn.ModuleList([
             SCSA(d_model) for _ in in_channels_list
-        ])
-
-        # Per-level deformable attention (after SCSA, before encoder)
-        self.deform_attn_levels = nn.ModuleList([
-            DeformableAttention(d_model) for _ in in_channels_list
         ])
 
         # Learnable level embedding to distinguish scales
@@ -236,14 +298,14 @@ class DETRHead(nn.Module):
         # Shared positional encoding
         self.pos_enc = PositionEmbeddingSine2D(d_model)
 
-        # Encoder
-        enc_layer = nn.TransformerEncoderLayer(
+        # Encoder: DeformableAttention replaces standard self-attention inside each layer
+        self.encoder = DeformableTransformerEncoder(
             d_model=d_model, nhead=nhead,
             dim_feedforward=d_model * 4,
-            dropout=dropout, activation="relu",
-            batch_first=True,
+            dropout=dropout,
+            num_layers=num_encoder_layers,
+            num_levels=len(in_channels_list),
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_encoder_layers)
 
         # Decoder
         dec_layer = nn.TransformerDecoderLayer(
@@ -267,10 +329,11 @@ class DETRHead(nn.Module):
 
         self._reset_parameters()
         # _reset_parameters applies xavier to all dim>1 weights globally,
-        # which overwrites DeformableAttention's intended zero-init on offset_proj.
-        # Re-apply the zero-init here so sampling starts at reference points.
-        for da in self.deform_attn_levels:
-            da._init_weights()
+        # which overwrites DeformableAttention's zero-init on offset_proj / attn_weight_proj.
+        # Re-apply zero-init so sampling starts at reference points with uniform weights.
+        for layer in self.encoder.layers:
+            for da in layer.deform_attns:
+                da._init_weights()
         self._print_params()
 
     def _reset_parameters(self):
@@ -313,13 +376,8 @@ class DETRHead(nn.Module):
             B, C, H, W = feat.shape
             spatial_shapes.append((H, W))
 
-            feat_flat = feat.flatten(2).transpose(1, 2) # [B, HW, C]
-            feat_proj = self.input_projs[i](feat_flat)  # [B, HW, d_model]
-
-            # Spatial attention chain: one reshape → SCSA → DeformableAttn → flatten
-            feat_spatial = feat_proj.transpose(1, 2).view(B, self.d_model, H, W)
+            feat_spatial = self.input_projs[i](feat)              # [B, d_model, H, W]
             feat_spatial = self.scsa_levels[i](feat_spatial)
-            feat_spatial = self.deform_attn_levels[i](feat_spatial)
             feat_proj = feat_spatial.flatten(2).transpose(1, 2)  # [B, HW, d_model]
 
             pos = self.pos_enc(H, W, device)            # [HW, d_model]
@@ -331,7 +389,7 @@ class DETRHead(nn.Module):
         src = torch.cat(src_list, dim=1)                # [B, sum(HiWi), d_model]
 
         # ---------- Encoder ----------
-        memory = self.encoder(src)                      # [B, HW_total, d_model]
+        memory = self.encoder(src, spatial_shapes)       # [B, HW_total, d_model]
 
         # ---------- Decoder queries ----------
         tgt = (self.query_embed.weight + self.query_pos.weight)  # [nq, d_model]

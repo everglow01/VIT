@@ -15,7 +15,7 @@ from torchvision.models.detection.transform import GeneralizedRCNNTransform
 
 import model.vit_model as vit_models
 import model.swin_model as swin_models
-from AttentionModules.SCSA import SCSA
+from AttentionModules import SCSA
 
 
 def _is_swin(backbone_name: str) -> bool:
