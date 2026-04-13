@@ -12,6 +12,7 @@ import math
 import torch
 import torch.nn as nn
 from AttentionModules.SCSA import SCSA
+from AttentionModules.DeformableAttention import DeformableAttention
 
 
 # ======================================================================
@@ -224,6 +225,11 @@ class DETRHead(nn.Module):
             SCSA(d_model) for _ in in_channels_list
         ])
 
+        # Per-level deformable attention (after SCSA, before encoder)
+        self.deform_attn_levels = nn.ModuleList([
+            DeformableAttention(d_model) for _ in in_channels_list
+        ])
+
         # Learnable level embedding to distinguish scales
         self.level_embed = nn.Embedding(len(in_channels_list), d_model)
 
@@ -260,6 +266,11 @@ class DETRHead(nn.Module):
         self.bbox_embed = MLP(d_model, d_model, 4, num_layers=3)
 
         self._reset_parameters()
+        # _reset_parameters applies xavier to all dim>1 weights globally,
+        # which overwrites DeformableAttention's intended zero-init on offset_proj.
+        # Re-apply the zero-init here so sampling starts at reference points.
+        for da in self.deform_attn_levels:
+            da._init_weights()
         self._print_params()
 
     def _reset_parameters(self):
@@ -305,10 +316,11 @@ class DETRHead(nn.Module):
             feat_flat = feat.flatten(2).transpose(1, 2) # [B, HW, C]
             feat_proj = self.input_projs[i](feat_flat)  # [B, HW, d_model]
 
-            # SCSA: reshape to spatial → attend → flatten back
-            feat_proj = self.scsa_levels[i](
-                feat_proj.transpose(1, 2).view(B, self.d_model, H, W)
-            ).flatten(2).transpose(1, 2)                # [B, HW, d_model]
+            # Spatial attention chain: one reshape → SCSA → DeformableAttn → flatten
+            feat_spatial = feat_proj.transpose(1, 2).view(B, self.d_model, H, W)
+            feat_spatial = self.scsa_levels[i](feat_spatial)
+            feat_spatial = self.deform_attn_levels[i](feat_spatial)
+            feat_proj = feat_spatial.flatten(2).transpose(1, 2)  # [B, HW, d_model]
 
             pos = self.pos_enc(H, W, device)            # [HW, d_model]
             lvl = self.level_embed.weight[i]            # [d_model]
