@@ -6,6 +6,7 @@ mask logits at p3 resolution (H/8 × W/8 for 224 input).
 """
 import torch
 import torch.nn as nn
+from AttentionModules.DANet import DANet
 
 
 class MaskBranch(nn.Module):
@@ -20,6 +21,7 @@ class MaskBranch(nn.Module):
         super().__init__()
         self.query_proj = nn.Linear(d_model, mask_dim)
         self.memory_proj = nn.Conv2d(d_model, mask_dim, kernel_size=1)
+        self.danet = DANet(mask_dim)
 
         self._print_params()
 
@@ -45,6 +47,7 @@ class MaskBranch(nn.Module):
         B = memory_p3.shape[0]
         feat_map = memory_p3.transpose(1, 2).reshape(B, -1, H3, W3)  # [B, d_model, H3, W3]
         feat_map = self.memory_proj(feat_map)                  # [B, mask_dim, H3, W3]
+        feat_map = self.danet(feat_map)                        # [B, mask_dim, H3, W3]
 
         # Project queries
         mask_emb = self.query_proj(hs)                         # [B, N, mask_dim]

@@ -15,6 +15,7 @@ from torchvision.models.detection.transform import GeneralizedRCNNTransform
 
 import model.vit_model as vit_models
 import model.swin_model as swin_models
+from AttentionModules.SCSA import SCSA
 
 
 def _is_swin(backbone_name: str) -> bool:
@@ -72,6 +73,9 @@ class SwinFPN(nn.Module):
             f"p{i+2}": nn.Conv2d(c, out_channels, 1)
             for i, c in enumerate(stage_channels)
         })
+        self.scsa_layers = nn.ModuleDict({
+            f"p{i+2}": SCSA(out_channels) for i in range(4)
+        })
         self.fpn = FeaturePyramidNetwork(
             in_channels_list=[out_channels] * 4,
             out_channels=out_channels,
@@ -80,7 +84,7 @@ class SwinFPN(nn.Module):
     def forward(self, feature_dict: dict) -> OrderedDict:
         projected = OrderedDict()
         for key in ["p2", "p3", "p4", "p5"]:
-            projected[key] = self.laterals[key](feature_dict[key])
+            projected[key] = self.scsa_layers[key](self.laterals[key](feature_dict[key]))
         return self.fpn(projected)
 
 

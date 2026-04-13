@@ -11,6 +11,7 @@ mask branch), memory (encoder output), and DN predictions when training.
 import math
 import torch
 import torch.nn as nn
+from AttentionModules.SCSA import SCSA
 
 
 # ======================================================================
@@ -218,6 +219,11 @@ class DETRHead(nn.Module):
             nn.Linear(c, d_model) for c in in_channels_list
         ])
 
+        # Per-level SCSA after projection (spatial attention before encoder)
+        self.scsa_levels = nn.ModuleList([
+            SCSA(d_model) for _ in in_channels_list
+        ])
+
         # Learnable level embedding to distinguish scales
         self.level_embed = nn.Embedding(len(in_channels_list), d_model)
 
@@ -298,6 +304,11 @@ class DETRHead(nn.Module):
 
             feat_flat = feat.flatten(2).transpose(1, 2) # [B, HW, C]
             feat_proj = self.input_projs[i](feat_flat)  # [B, HW, d_model]
+
+            # SCSA: reshape to spatial → attend → flatten back
+            feat_proj = self.scsa_levels[i](
+                feat_proj.transpose(1, 2).view(B, self.d_model, H, W)
+            ).flatten(2).transpose(1, 2)                # [B, HW, d_model]
 
             pos = self.pos_enc(H, W, device)            # [HW, d_model]
             lvl = self.level_embed.weight[i]            # [d_model]
