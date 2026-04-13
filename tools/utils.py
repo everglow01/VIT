@@ -38,55 +38,93 @@ def extract_state_dict(ckpt) -> dict:
     return ckpt
 
 
-def make_param_groups(model, lr: float, backbone_lr_scale: float = 0.1):
-    """Split model parameters into backbone (lower LR) and head (full LR) groups.
+def _no_decay(name: str, param) -> bool:
+    """Return True if this parameter should be excluded from weight decay.
 
-    Splitting logic:
+    Excluded:
+      - All bias terms (name ends with '.bias')
+      - 1-D parameters: LayerNorm / BatchNorm weight+bias, embedding vectors
+    """
+    return name.endswith(".bias") or param.ndim <= 1
+
+
+def make_param_groups(
+    model,
+    lr: float,
+    backbone_lr_scale: float = 0.1,
+    weight_decay: float = 0.0,
+):
+    """Split model parameters into up to 4 groups by (role × decay).
+
+    Axes:
+      1. Role  — backbone (lr × scale) vs head (full lr)
+      2. Decay — weight matrices / conv filters get ``weight_decay``;
+                 biases and 1-D norm params get ``weight_decay=0``
+
+    Splitting logic (role):
       - Models with a ``backbone`` attribute (detect / segment / DETR):
-          params whose name starts with ``backbone.`` → backbone group (lr × scale)
-          all other trainable params                  → head group    (lr)
+          params whose name starts with ``backbone.`` → backbone group
+          all other trainable params                  → head group
       - Classify models (ViT / Swin used directly, no ``backbone`` attribute):
-          params whose name contains ``head.`` or ``pre_logits.`` → head group (lr)
-          all other trainable params                               → backbone group (lr × scale)
+          params whose name contains ``head.`` or ``pre_logits.`` → head group
+          all other trainable params                               → backbone group
 
-    If backbone is frozen (all backbone params have requires_grad=False), the backbone
-    group will be empty and the function transparently returns a single-group list,
-    so it is safe to call unconditionally regardless of freeze settings.
+    If backbone is fully frozen the backbone groups are empty and are omitted,
+    so callers can pass this list directly to any optimizer unconditionally.
 
     Args:
         model             : the model whose parameters to split
         lr                : base (head) learning rate
         backbone_lr_scale : multiplier applied to backbone LR (default 0.1)
+        weight_decay      : weight decay applied to decay-eligible params (default 0)
 
     Returns:
-        list of param-group dicts suitable for passing directly to an optimizer
+        list of param-group dicts suitable for passing directly to an optimizer.
+        Each group carries explicit ``lr`` and ``weight_decay`` keys so the
+        optimizer constructor does not need to specify them.
     """
-    backbone_params, head_params = [], []
+    # buckets: (role, decay) → list[param]
+    buckets: dict = {
+        ("head",     True):  [],
+        ("head",     False): [],
+        ("backbone", True):  [],
+        ("backbone", False): [],
+    }
     has_backbone_attr = hasattr(model, "backbone")
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        # Determine role
         if has_backbone_attr:
-            if name.startswith("backbone."):
-                backbone_params.append(p)
-            else:
-                head_params.append(p)
+            role = "backbone" if name.startswith("backbone.") else "head"
         else:
-            if "head." in name or "pre_logits." in name:
-                head_params.append(p)
-            else:
-                backbone_params.append(p)
+            role = "head" if ("head." in name or "pre_logits." in name) else "backbone"
+        # Determine decay eligibility
+        decay = not _no_decay(name, p)
+        buckets[(role, decay)].append(p)
 
-    groups = [{"params": head_params, "lr": lr}]
-    if backbone_params:
-        groups.append({"params": backbone_params, "lr": lr * backbone_lr_scale})
+    groups = []
+    for (role, decay), params in buckets.items():
+        if not params:
+            continue
+        group_lr = lr if role == "head" else lr * backbone_lr_scale
+        groups.append({
+            "params":       params,
+            "lr":           group_lr,
+            "weight_decay": weight_decay if decay else 0.0,
+        })
 
-    n_backbone = len(backbone_params)
-    n_head     = len(head_params)
-    bb_lr_str  = f"{lr * backbone_lr_scale:.2e}" if backbone_params else "frozen"
-    print(f"[ParamGroups] head={n_head} params @ lr={lr:.2e} | "
-          f"backbone={n_backbone} params @ lr={bb_lr_str}")
+    # Summary
+    def _cnt(role, decay): return len(buckets[(role, decay)])
+    bb_lr_str = f"{lr * backbone_lr_scale:.2e}" if (
+        _cnt("backbone", True) + _cnt("backbone", False) > 0) else "frozen"
+    print(
+        f"[ParamGroups] "
+        f"head_decay={_cnt('head', True)} head_nodecay={_cnt('head', False)} @ lr={lr:.2e} | "
+        f"backbone_decay={_cnt('backbone', True)} backbone_nodecay={_cnt('backbone', False)} "
+        f"@ lr={bb_lr_str}  (weight_decay={weight_decay})"
+    )
     return groups
 
 

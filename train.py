@@ -278,8 +278,8 @@ def _train_classify(args, device, exp_folder, weights_folder):
 
     model = build_model_and_prepare(args, device, num_classes)
 
-    pg = make_param_groups(model, args.lr, args.backbone_lr_scale)
-    optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=5e-5)
+    optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=0.0)
     lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
@@ -413,8 +413,8 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         )
     model.to(device)
 
-    pg = make_param_groups(model, args.lr, args.backbone_lr_scale)
-    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=0.05)
+    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.0)
     lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
@@ -580,8 +580,8 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
     )
     model.to(device)
 
-    pg = make_param_groups(model, args.lr, args.backbone_lr_scale)
-    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.05)
+    pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=0.05)
+    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.0)
     lf = make_cosine_lr(args.epochs, args.lrf, args.warmup_epochs)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
