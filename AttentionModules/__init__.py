@@ -11,7 +11,6 @@ from .ACmix import ACmix
 from .BAM import BAM
 from .CA import CA
 from .CBAM import SBAM as CBAM
-from .CBAM import SBAM
 from .CCAM import CCAM
 from .ECA import ECA
 from .ELA import ELA
@@ -34,7 +33,6 @@ __all__ = [
 	"BAM",
 	"CA",
 	"CBAM",
-	"SBAM",
 	"CCAM",
 	"ECA",
 	"ELA",

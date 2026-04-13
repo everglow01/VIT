@@ -159,6 +159,10 @@ class DeformableAttention(nn.Module):
         # 随着训练推进，网络自动学习偏移稀疏注意力模式
         nn.init.constant_(self.offset_proj.weight, 0.0)
         nn.init.constant_(self.offset_proj.bias, 0.0)
+        # 注意力权重投影初始化为零：softmax(zeros) = uniform(1/num_points)
+        # 确保训练初期各采样点权重相等，避免随机初始化导致的权重分布不均匀
+        nn.init.constant_(self.attn_weight_proj.weight, 0.0)
+        nn.init.constant_(self.attn_weight_proj.bias, 0.0)
 
     def forward(self, x):
         """
