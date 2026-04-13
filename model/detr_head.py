@@ -406,10 +406,15 @@ class DETRHead(nn.Module):
             if dn_queries is not None:
                 tgt = torch.cat([tgt, dn_queries], dim=1)
 
-        # ---------- Decoder ----------
-        hs = self.decoder(tgt, memory, tgt_mask=attn_mask)  # [B, nq+dn_len, d_model]
+        # ---------- Decoder (layer-by-layer to capture intermediate outputs) ----------
+        output = tgt
+        hs_layers = []                             # one entry per decoder layer
+        for layer in self.decoder.layers:
+            output = layer(output, memory, tgt_mask=attn_mask)
+            hs_layers.append(output)               # [B, nq+dn_len, d_model]
 
-        # ---------- Split & predict ----------
+        # ---------- Split & predict (last layer → main output) ----------
+        hs = hs_layers[-1]
         hs_matching = hs[:, :self.num_queries]
 
         pred_logits = self.class_embed(hs_matching)             # [B, nq, C+1]
@@ -428,5 +433,18 @@ class DETRHead(nn.Module):
             out["dn_pred_logits"] = self.class_embed(hs_dn)
             out["dn_pred_boxes"] = self.bbox_embed(hs_dn).sigmoid()
             out["dn_meta"] = dn_meta
+
+        # ---------- Auxiliary outputs (intermediate layers, training only) ----------
+        # Each intermediate layer gets its own predictions for auxiliary loss supervision.
+        # Using shared class_embed / bbox_embed keeps parameter count unchanged.
+        if self.training:
+            aux_outputs = []
+            for hs_l in hs_layers[:-1]:            # all layers except the last
+                hs_m = hs_l[:, :self.num_queries]
+                aux_outputs.append({
+                    "pred_logits": self.class_embed(hs_m),
+                    "pred_boxes":  self.bbox_embed(hs_m).sigmoid(),
+                })
+            out["aux_outputs"] = aux_outputs
 
         return out
