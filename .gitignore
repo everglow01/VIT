@@ -30,3 +30,5 @@ onnx_tools/*.onnx
 code_improvment.md
 code_improvment1.md
 swin_backbone_integration.md
+detr.md
+.codex
