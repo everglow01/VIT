@@ -193,10 +193,44 @@ def make_cosine_lr(epochs: int, lrf: float, warmup_epochs: int = 0):
     """
     def fn(x):
         if warmup_epochs > 0 and x < warmup_epochs:
-            return x / warmup_epochs                                    # 0 → 1 线性升
+            return (x + 1) / warmup_epochs                             # 1/W → 1 线性升
         t = (x - warmup_epochs) / max(epochs - warmup_epochs, 1)
         return ((1 + math.cos(t * math.pi)) / 2) * (1 - lrf) + lrf    # 余弦降
     return fn
+
+
+class EarlyStopping:
+    """Stop training when a monitored metric has stopped improving.
+
+    Args:
+        patience: Number of epochs with no improvement after which training stops.
+                  Set to 0 to disable.
+        mode: 'max' (higher is better, e.g. accuracy/mAP) or 'min' (lower is better, e.g. loss).
+    """
+
+    def __init__(self, patience: int = 10, mode: str = "max"):
+        self.patience = patience
+        self.mode = mode
+        self.best = float("-inf") if mode == "max" else float("inf")
+        self.counter = 0
+        self.best_epoch = -1
+
+    def step(self, metric: float, epoch: int) -> bool:
+        """Update with the latest metric. Returns True if training should stop."""
+        if self.patience <= 0:
+            return False
+        improved = (metric > self.best) if self.mode == "max" else (metric < self.best)
+        if improved:
+            self.best = metric
+            self.best_epoch = epoch
+            self.counter = 0
+        else:
+            self.counter += 1
+        if self.counter >= self.patience:
+            print(f"[EarlyStopping] No improvement for {self.patience} epochs "
+                  f"(best={self.best:.4f} at epoch {self.best_epoch}). Stopping.")
+            return True
+        return False
 
 
 # 控制台打印参数类
@@ -395,7 +429,8 @@ def read_split_data(
 
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
-                    loss_function=None, printer=None, ema=None):
+                    loss_function=None, printer=None, ema=None,
+                    scaler=None, accumulate_steps=1):
     if printer is None:
         printer = ConsolePrinter()
     if loss_function is None:
@@ -405,6 +440,8 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
     accu_loss = torch.zeros(1, device=device)
     accu_num  = torch.zeros(1, device=device)
     sample_num = 0
+    accumulate_steps = max(1, accumulate_steps)
+    use_amp = scaler is not None
 
     optimizer.zero_grad()
 
@@ -416,22 +453,32 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, epochs,
         labels = labels.to(device, non_blocking=True)
 
         sample_num += images.size(0)
-        img_size = images.shape[-1]  # 假设输入方图，比如 224
+        img_size = images.shape[-1]
 
-        pred = model(images)
-        pred_classes = pred.argmax(dim=1)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(images)
+            loss = loss_function(pred, labels) / accumulate_steps
+
+        pred_classes = pred.detach().argmax(dim=1)
         accu_num += (pred_classes == labels).sum()
 
-        loss = loss_function(pred, labels)
-        loss.backward()
-        optimizer.step()
-        if ema is not None:
-            ema.update(model)
-        optimizer.zero_grad()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-        accu_loss += loss.detach()
+        if (step + 1) % accumulate_steps == 0 or (step + 1) == len(data_loader):
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            if ema is not None:
+                ema.update(model)
+            optimizer.zero_grad()
 
-        # 动态显示当前"累计均值"
+        accu_loss += loss.detach() * accumulate_steps
+
         avg_loss = accu_loss.item() / (step + 1)
         avg_acc  = accu_num.item() / sample_num
 

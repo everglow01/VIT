@@ -16,6 +16,7 @@ Factory functions:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 
@@ -143,38 +144,65 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio),
                        act_layer=act_layer, drop=drop)
 
+        # Precompute mask for the default (init-time) resolution
         if self.shift_size > 0:
-            H, W = self.input_resolution
-            img_mask = torch.zeros(1, H, W, 1)
-            h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-            mask_windows = window_partition(img_mask, self.window_size).view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+            attn_mask = self._compute_attn_mask(
+                *self.input_resolution, self.window_size, self.shift_size)
         else:
             attn_mask = None
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x):
-        H, W = self.input_resolution
+    @staticmethod
+    def _compute_attn_mask(H, W, window_size, shift_size):
+        """Build shifted-window attention mask for the given spatial size."""
+        img_mask = torch.zeros(1, H, W, 1)
+        h_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
+        w_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = window_partition(img_mask, window_size).view(-1, window_size * window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+
+    def forward(self, x, H, W):
         B, L, C = x.shape
+        ws = self.window_size
+        ss = self.shift_size
+
         shortcut = x
         x = self.norm1(x).view(B, H, W, C)
 
-        if self.shift_size > 0:
-            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        # Pad to multiples of window_size
+        pad_b = (ws - H % ws) % ws
+        pad_r = (ws - W % ws) % ws
+        if pad_b > 0 or pad_r > 0:
+            x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        Hp, Wp = x.shape[1], x.shape[2]
 
-        x_windows = window_partition(x, self.window_size).view(-1, self.window_size * self.window_size, C)
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)
-        x = window_reverse(attn_windows.view(-1, self.window_size, self.window_size, C), self.window_size, H, W)
+        # Shifted window attention
+        if ss > 0:
+            x = torch.roll(x, shifts=(-ss, -ss), dims=(1, 2))
+            # Reuse precomputed mask when padded size matches init resolution
+            if (Hp, Wp) == tuple(self.input_resolution):
+                mask = self.attn_mask
+            else:
+                mask = self._compute_attn_mask(Hp, Wp, ws, ss).to(x.device)
+        else:
+            mask = None
 
-        if self.shift_size > 0:
-            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        x_windows = window_partition(x, ws).view(-1, ws * ws, C)
+        attn_windows = self.attn(x_windows, mask=mask)
+        x = window_reverse(attn_windows.view(-1, ws, ws, C), ws, Hp, Wp)
+
+        if ss > 0:
+            x = torch.roll(x, shifts=(ss, ss), dims=(1, 2))
+
+        # Remove padding
+        if pad_b > 0 or pad_r > 0:
+            x = x[:, :H, :W, :].contiguous()
 
         x = shortcut + self.drop_path(x.view(B, H * W, C))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -189,13 +217,16 @@ class PatchMerging(nn.Module):
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
-    def forward(self, x):
-        H, W = self.input_resolution
+    def forward(self, x, H, W):
         B, L, C = x.shape
         x = x.view(B, H, W, C)
+        # Pad if H or W is odd so 2x2 merging works
+        if H % 2 == 1 or W % 2 == 1:
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
         x = torch.cat([x[:, 0::2, 0::2, :], x[:, 1::2, 0::2, :],
                         x[:, 0::2, 1::2, :], x[:, 1::2, 1::2, :]], dim=-1)
-        return self.reduction(self.norm(x.view(B, -1, 4 * C)))
+        H_out, W_out = (H + 1) // 2, (W + 1) // 2
+        return self.reduction(self.norm(x.view(B, -1, 4 * C))), H_out, W_out
 
 
 class BasicLayer(nn.Module):
@@ -217,13 +248,13 @@ class BasicLayer(nn.Module):
         ])
         self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer) if downsample else None
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, H, W)
         before_downsample = x
         if self.downsample is not None:
-            x = self.downsample(x)
-        return x, before_downsample
+            x, H, W = self.downsample(x, H, W)
+        return x, before_downsample, H, W
 
 
 class PatchEmbed(nn.Module):
@@ -237,7 +268,10 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
-        return self.norm(self.proj(x).flatten(2).transpose(1, 2))
+        x = self.proj(x)                          # [B, C, H_grid, W_grid]
+        H, W = x.shape[2], x.shape[3]
+        x = self.norm(x.flatten(2).transpose(1, 2))  # [B, H*W, C]
+        return x, H, W
 
 
 class SwinTransformer(nn.Module):
@@ -307,28 +341,28 @@ class SwinTransformer(nn.Module):
             nn.init.ones_(m.weight)
 
     def forward_features_map(self, x):
-        """Returns dict of 4 feature maps keyed 'p2'..'p5'."""
-        x = self.pos_drop(self.patch_embed(x))
-        resolutions = [
-            self.patch_embed.grid_size,
-            (self.patch_embed.grid_size[0] // 2, self.patch_embed.grid_size[1] // 2),
-            (self.patch_embed.grid_size[0] // 4, self.patch_embed.grid_size[1] // 4),
-            (self.patch_embed.grid_size[0] // 8, self.patch_embed.grid_size[1] // 8),
-        ]
+        """Returns dict of 4 feature maps keyed 'p2'..'p5'.
+
+        Supports arbitrary input resolutions — spatial dimensions are computed
+        dynamically from the actual tensor rather than the init-time img_size.
+        """
+        x, H, W = self.patch_embed(x)
+        x = self.pos_drop(x)
         feature_maps = {}
         for i, layer in enumerate(self.layers):
-            x, before_down = layer(x)
+            H_in, W_in = H, W          # resolution entering this stage
+            x, before_down, H, W = layer(x, H_in, W_in)
             norm = getattr(self, f"norm{i}")
             feat = norm(before_down)
-            H, W = resolutions[i]
             C = feat.shape[-1]
-            feature_maps[f"p{i+2}"] = feat.transpose(1, 2).reshape(-1, C, H, W)
+            feature_maps[f"p{i+2}"] = feat.transpose(1, 2).reshape(-1, C, H_in, W_in)
         return feature_maps
 
     def forward(self, x):
-        x = self.pos_drop(self.patch_embed(x))
+        x, H, W = self.patch_embed(x)
+        x = self.pos_drop(x)
         for layer in self.layers:
-            x, _ = layer(x)
+            x, _, H, W = layer(x, H, W)
         x = self.norm_cls(x)
         x = torch.flatten(self.avgpool(x.transpose(1, 2)), 1)
         return self.head(x)

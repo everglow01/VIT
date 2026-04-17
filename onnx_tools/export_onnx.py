@@ -16,11 +16,11 @@ from onnx_tools.common import (
 def main():
     parser = argparse.ArgumentParser(description="Export ViT/Swin classification/detection/segmentation model to ONNX")
     parser.add_argument("--weights", "--weight", dest="weights", type=str, required=True)
-    parser.add_argument("--model", type=str, default="vit_base_patch16_224_in21k",
+    parser.add_argument("--model", type=str, default="swin_base_patch4_window7_224",
                         choices=list(MODEL_BUILDERS.keys()))
     parser.add_argument("--task", type=str, default="auto",
                         choices=["auto", "classify", "detect", "segment"])
-    parser.add_argument("--num-classes", type=int, required=True)
+    parser.add_argument("--num-classes", type=int, default=3, required=True)
     parser.add_argument("--output", type=str, default=None,
                         help="Output .onnx path (default: same folder as weights)")
     parser.add_argument("--input-size", type=int, default=224)

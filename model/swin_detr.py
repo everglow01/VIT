@@ -49,10 +49,14 @@ class SwinDETR(nn.Module):
         cost_bbox=5.0,
         cost_giou=2.0,
         eos_coef=0.1,
+        min_size=800,
+        max_size=1333,
+        conf_thresh=0.5,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.task = task
+        self.conf_thresh = conf_thresh
 
         # ---- Backbone ----
         factory = getattr(swin_models, backbone_name)
@@ -142,12 +146,11 @@ class SwinDETR(nn.Module):
             eos_coef=eos_coef,
         )
 
-        # ---- Image transform (same as Faster R-CNN pipeline) ----
+        # ---- Image transform ----
         self.transform = GeneralizedRCNNTransform(
-            min_size=224, max_size=224,
+            min_size=min_size, max_size=max_size,
             image_mean=[0.485, 0.456, 0.406],
             image_std=[0.229, 0.224, 0.225],
-            fixed_size=(224, 224),
         )
 
         self._print_params()
@@ -235,7 +238,7 @@ class SwinDETR(nn.Module):
         for b in range(B):
             probs = pred_logits[b].softmax(-1)     # [nq, C+1]
             scores, labels = probs[:, :-1].max(-1) # exclude background column
-            keep = scores > 0.5 # confidence threshold (tune as needed)如果需要更高的召回率，可以降低这个阈值；如果需要更高的精确率，可以提高这个阈值。
+            keep = scores > self.conf_thresh
             keeps.append(keep)
 
             s = scores[keep]
@@ -299,6 +302,9 @@ def build_detr_model(
     cost_class=1.0,
     cost_bbox=5.0,
     cost_giou=2.0,
+    min_size=800,
+    max_size=1333,
+    conf_thresh=0.5,
 ):
     return SwinDETR(
         backbone_name=backbone_name,
@@ -315,4 +321,7 @@ def build_detr_model(
         cost_class=cost_class,
         cost_bbox=cost_bbox,
         cost_giou=cost_giou,
+        min_size=min_size,
+        max_size=max_size,
+        conf_thresh=conf_thresh,
     )

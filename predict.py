@@ -384,6 +384,9 @@ def run_detr_task(args, device, exp_folder, task: str):
         num_decoder_layers=old_args.get("num_dec_layers", 4),
         num_queries=old_args.get("num_queries", 100),
         num_dn_groups=old_args.get("num_dn_groups", 2),
+        min_size=old_args.get("min_size", 224),
+        max_size=old_args.get("max_size", 224),
+        conf_thresh=CONF_THRESH,
     ).to(device)
 
     state = extract_state_dict(ckpt)
@@ -443,8 +446,8 @@ if __name__ == "__main__":
 
     # ---- NMS (optional post-processing) ----
     parser.add_argument("--nms", action=argparse.BooleanOptionalAction, default=True,
-                        help="Apply per-class NMS after confidence filtering (default: off)")
-    parser.add_argument("--nms-iou", type=float, default=0.8,
+                        help="Apply per-class NMS after confidence filtering (default: on, use --no-nms to disable)")
+    parser.add_argument("--nms-iou", type=float, default=0.5,
                         help="IoU threshold for NMS (default: 0.5)")
 
     # ---- classify only ----

@@ -12,7 +12,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 from tools.my_dataset import build_vit_dataloaders
 from tools.utils import (read_split_data, train_one_epoch, evaluate, ConsolePrinter,
                          get_model_factory, extract_state_dict, make_cosine_lr,
-                         make_param_groups, ModelEMA)
+                         make_param_groups, ModelEMA, EarlyStopping)
 from tools.create_exp_folder import create_exp_folder
 from tools.plot_metrics import plot_from_metrics_csv, plot_val_prf_curves, save_confusion_matrices
 
@@ -291,6 +291,16 @@ def _train_classify(args, device, exp_folder, weights_folder):
     best_ckpt_path = os.path.join(weights_folder, "best.pth")
     best_val_acc = -1.0
     best_epoch = -1
+    early_stop = EarlyStopping(patience=args.patience, mode="max")
+
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
+    if use_amp:
+        print("[AMP] enabled")
+    if args.accumulate_steps > 1:
+        print(f"[GradAccum] steps={args.accumulate_steps}, effective batch_size={args.batch_size * args.accumulate_steps}")
+
+    tb_writer = _create_tb_writer(args, exp_folder)
 
     printer = ConsolePrinter()
     loss_function = torch.nn.CrossEntropyLoss()
@@ -301,6 +311,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
             model=model, optimizer=optimizer, data_loader=train_loader,
             device=device, epoch=epoch, epochs=args.epochs,
             loss_function=loss_function, printer=printer, ema=ema,
+            scaler=scaler, accumulate_steps=args.accumulate_steps,
         )
         scheduler.step()
 
@@ -320,6 +331,14 @@ def _train_classify(args, device, exp_folder, weights_folder):
             writer = csv.writer(f)
             writer.writerow([epoch, train_loss, train_acc_value, val_loss, val_acc_value, val_p, val_r, val_f1, lr_now])
 
+        if tb_writer is not None:
+            tb_writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, epoch)
+            tb_writer.add_scalars("Accuracy", {"train": train_acc_value, "val": val_acc_value}, epoch)
+            tb_writer.add_scalar("LR", lr_now, epoch)
+            tb_writer.add_scalar("Val/Precision", val_p, epoch)
+            tb_writer.add_scalar("Val/Recall", val_r, epoch)
+            tb_writer.add_scalar("Val/F1", val_f1, epoch)
+
         ckpt = {
             "epoch": epoch, "model_state": model.state_dict(),
             "ema_state": ema.state_dict() if ema is not None else None,
@@ -332,6 +351,12 @@ def _train_classify(args, device, exp_folder, weights_folder):
             best_val_acc = val_acc_value
             best_epoch = epoch
             torch.save(ckpt, best_ckpt_path)
+
+        if early_stop.step(val_acc_value, epoch):
+            break
+
+    if tb_writer is not None:
+        tb_writer.close()
 
     import pandas as pd
     metrics_df = pd.read_csv(metrics_path)
@@ -392,6 +417,254 @@ def _load_resume_ckpt(resume_path, model, optimizer, scheduler, device, args, em
     return start_epoch, best_metric, best_epoch
 
 
+# ======================================================================
+# Shared helpers for detect / segment / DETR training loops
+# ======================================================================
+
+def _create_tb_writer(args, exp_folder):
+    """Create a TensorBoard SummaryWriter if --tensorboard is enabled."""
+    if not getattr(args, 'tensorboard', False):
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_dir = os.path.join(exp_folder, "tb_logs")
+        writer = SummaryWriter(log_dir=tb_dir)
+        print(f"[TensorBoard] logging to {tb_dir}")
+        return writer
+    except ImportError:
+        print("[TensorBoard] tensorboard not installed, skipping. pip install tensorboard")
+        return None
+
+
+def _setup_training_state(args, model, optimizer, scheduler, device, ema, weights_folder, exp_folder):
+    """Shared initialisation for detection-style training loops.
+
+    Returns a dict with: last_ckpt_path, best_ckpt_path, best_metric, best_epoch,
+    early_stop, scaler, accumulate_steps, start_epoch, eval_interval.
+    """
+    use_amp = args.amp and device.type == "cuda"
+    accumulate_steps = max(1, args.accumulate_steps)
+
+    state = {
+        "last_ckpt_path": os.path.join(weights_folder, "last.pth"),
+        "best_ckpt_path": os.path.join(weights_folder, "best.pth"),
+        "best_metric": -1.0,
+        "best_epoch": -1,
+        "eval_interval": max(1, int(args.eval_interval)),
+        "early_stop": EarlyStopping(patience=args.patience, mode="max"),
+        "use_amp": use_amp,
+        "scaler": torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None,
+        "accumulate_steps": accumulate_steps,
+        "start_epoch": 0,
+        "tb_writer": _create_tb_writer(args, exp_folder),
+    }
+
+    if use_amp:
+        print("[AMP] enabled")
+    if accumulate_steps > 1:
+        print(f"[GradAccum] steps={accumulate_steps}, effective batch_size={args.batch_size * accumulate_steps}")
+
+    if getattr(args, 'resume', ''):
+        state["start_epoch"], state["best_metric"], state["best_epoch"] = _load_resume_ckpt(
+            args.resume, model, optimizer, scheduler, device, args, ema=ema)
+
+    return state
+
+
+def _train_one_epoch_det(model, train_loader, optimizer, device, epoch, args,
+                         printer, scaler, use_amp, accumulate_steps, ema,
+                         loss_key=None, max_norm=1.0, extra_loss_keys=()):
+    """Run one training epoch for detection-style models (Faster R-CNN / Mask R-CNN / DETR).
+
+    Args:
+        loss_key: If None, total loss = sum(loss_dict.values()).
+                  If a string (e.g. "loss_total"), total loss = loss_dict[loss_key].
+        max_norm: Gradient clipping max norm.
+        extra_loss_keys: Tuple of extra loss keys to track (e.g. ("loss_ce", "loss_bbox", "loss_giou")).
+
+    Returns:
+        (avg_loss, extra_avgs: dict, n_batches)
+    """
+    model.train()
+    total_loss = 0.0
+    extra_totals = {k: 0.0 for k in extra_loss_keys}
+    n_batches = 0
+
+    print()
+    print(printer.train_header(colored=True))
+    print(f"[Train][epoch {epoch+1}/{args.epochs}] total_batches={len(train_loader)}")
+
+    pbar = tqdm(
+        train_loader,
+        dynamic_ncols=True,
+        bar_format=printer.BAR_FORMAT,
+        leave=True,
+    )
+    optimizer.zero_grad()
+    for step, (images, targets) in enumerate(pbar):
+        img_size = int(images[0].shape[-1]) if images else 0
+        images  = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            loss_dict = model(images, targets)
+            raw_loss = loss_dict[loss_key] if loss_key else sum(loss_dict.values())
+            loss = raw_loss / accumulate_steps
+
+        if not torch.isfinite(loss):
+            print(f"\nWARNING: non-finite loss at epoch {epoch+1}, skipping batch: {loss}")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if (step + 1) % accumulate_steps == 0 or (step + 1) == len(train_loader):
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                optimizer.step()
+            if ema is not None:
+                ema.update(model)
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * accumulate_steps
+        for k in extra_loss_keys:
+            if k in loss_dict:
+                extra_totals[k] += loss_dict[k].item()
+        n_batches += 1
+
+        avg_loss = total_loss / n_batches
+        desc = printer.train_desc(epoch + 1, args.epochs, avg_loss, 0.0, img_size)
+        pbar.set_description_str(desc)
+
+    avg_loss = total_loss / max(n_batches, 1)
+    extra_avgs = {k: v / max(n_batches, 1) for k, v in extra_totals.items()}
+    return avg_loss, extra_avgs, n_batches
+
+
+def _eval_and_log_det(task, do_eval, eval_model, val_loader, device, args,
+                      epoch, avg_loss, lr_now, metrics_path, exp_folder,
+                      evaluate_detection, evaluate_segmentation,
+                      extra_avgs=None, tb_writer=None):
+    """Run evaluation and write CSV row for detect/segment tasks. Returns primary metric or None."""
+    # TensorBoard: always log train loss and LR
+    if tb_writer is not None:
+        tb_writer.add_scalar("Train/loss", avg_loss, epoch)
+        tb_writer.add_scalar("LR", lr_now, epoch)
+        if extra_avgs:
+            for k, v in extra_avgs.items():
+                if isinstance(v, (int, float)):
+                    tb_writer.add_scalar(f"Train/{k}", v, epoch)
+
+    if task == "detect":
+        if do_eval:
+            print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running detection evaluation...")
+            is_last = (epoch + 1) == args.epochs
+            metrics = evaluate_detection(eval_model, val_loader, device, ann_file=args.val_ann_file,
+                                         save_dir=exp_folder if is_last else None)
+            map50    = metrics["mAP50"]
+            map50_95 = metrics["mAP50_95"]
+            loss_parts = (f"ce={extra_avgs['loss_ce']:.4f} bbox={extra_avgs['loss_bbox']:.4f} "
+                          f"giou={extra_avgs['loss_giou']:.4f}  " if extra_avgs else "")
+            print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  {loss_parts}"
+                  f"mAP50={map50:.4f}  mAP50-95={map50_95:.4f}  lr={lr_now:.6f}")
+            if extra_avgs:
+                row = [epoch, avg_loss, extra_avgs["loss_ce"], extra_avgs["loss_bbox"],
+                       extra_avgs["loss_giou"], map50, map50_95, lr_now]
+            else:
+                row = [epoch, avg_loss, map50, map50_95, lr_now]
+            with open(metrics_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+            if tb_writer is not None:
+                tb_writer.add_scalar("Val/mAP50", map50, epoch)
+                tb_writer.add_scalar("Val/mAP50_95", map50_95, epoch)
+            return map50
+        else:
+            eval_interval = max(1, int(args.eval_interval))
+            print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  eval=skipped (every {eval_interval} epochs)  lr={lr_now:.6f}")
+            if extra_avgs:
+                row = [epoch, avg_loss, extra_avgs["loss_ce"], extra_avgs["loss_bbox"],
+                       extra_avgs["loss_giou"], "", "", lr_now]
+            else:
+                row = [epoch, avg_loss, "", "", lr_now]
+            with open(metrics_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+            return None
+    else:  # segment
+        if do_eval:
+            print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running segmentation evaluation...")
+            is_last = (epoch + 1) == args.epochs
+            metrics = evaluate_segmentation(eval_model, val_loader, device, ann_file=args.val_ann_file,
+                                            save_dir=exp_folder if is_last else None)
+            print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
+                  f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
+            if extra_avgs:
+                row = [epoch, avg_loss, extra_avgs["loss_ce"], extra_avgs["loss_bbox"],
+                       extra_avgs["loss_giou"], extra_avgs.get("loss_mask", ""),
+                       extra_avgs.get("loss_dice", ""),
+                       metrics["box_mAP50"], metrics["box_mAP50_95"],
+                       metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now]
+            else:
+                row = [epoch, avg_loss,
+                       metrics["box_mAP50"], metrics["box_mAP50_95"],
+                       metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now]
+            with open(metrics_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+            if tb_writer is not None:
+                tb_writer.add_scalar("Val/box_mAP50", metrics["box_mAP50"], epoch)
+                tb_writer.add_scalar("Val/box_mAP50_95", metrics["box_mAP50_95"], epoch)
+                tb_writer.add_scalar("Val/mask_mAP50", metrics["mask_mAP50"], epoch)
+                tb_writer.add_scalar("Val/mask_mAP50_95", metrics["mask_mAP50_95"], epoch)
+            return metrics["mask_mAP50"] if not extra_avgs else metrics["box_mAP50"] + metrics["mask_mAP50"]
+        else:
+            eval_interval = max(1, int(args.eval_interval))
+            print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  eval=skipped (every {eval_interval} epochs)  lr={lr_now:.6f}")
+            if extra_avgs:
+                row = [epoch, avg_loss, extra_avgs["loss_ce"], extra_avgs["loss_bbox"],
+                       extra_avgs["loss_giou"], extra_avgs.get("loss_mask", ""),
+                       extra_avgs.get("loss_dice", ""),
+                       "", "", "", "", lr_now]
+            else:
+                row = [epoch, avg_loss, "", "", "", "", lr_now]
+            with open(metrics_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+            return None
+
+
+def _save_checkpoint_and_check(model, optimizer, scheduler, ema, args,
+                               epoch, best_metric, best_epoch, primary,
+                               early_stop, last_ckpt_path, best_ckpt_path):
+    """Save checkpoint. Returns (best_metric, best_epoch, should_stop)."""
+    if (primary is not None) and (primary > best_metric):
+        best_metric = primary
+        best_epoch = epoch
+
+    ckpt = {
+        "epoch": epoch, "model_state": model.state_dict(),
+        "ema_state": ema.state_dict() if ema is not None else None,
+        "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
+        "best_metric": best_metric, "best_epoch": best_epoch,
+        "args": vars(args),
+    }
+    torch.save(ckpt, last_ckpt_path)
+    if epoch == best_epoch:
+        torch.save(ckpt, best_ckpt_path)
+
+    should_stop = (primary is not None and early_stop.step(primary, epoch))
+    return best_metric, best_epoch, should_stop
+
+
+# ======================================================================
+# Detection / segmentation training loops
+# ======================================================================
+
 def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
     (build_coco_dataloaders, evaluate_detection, evaluate_segmentation,
      build_detection_model, build_segmentation_model) = _import_det_seg()
@@ -438,127 +711,63 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         header = ["epoch", "train_loss", "mAP50", "mAP50_95", "lr"]
     else:
         header = ["epoch", "train_loss", "box_mAP50", "box_mAP50_95", "mask_mAP50", "mask_mAP50_95", "lr"]
-    # 续训时 CSV 已存在，追加数据行，不重复写表头；新训始终重建文件
     if not (getattr(args, 'resume', '') and os.path.exists(metrics_path)):
         with open(metrics_path, "w", newline="") as f:
             csv.writer(f).writerow(header)
 
-    last_ckpt_path = os.path.join(weights_folder, "last.pth")
-    best_ckpt_path = os.path.join(weights_folder, "best.pth")
-    best_metric = -1.0
-    best_epoch = -1
-    eval_interval = max(1, int(args.eval_interval))
-
-    # 续训：恢复模型/优化器/调度器状态，LR 自动从断点延续
-    start_epoch = 0
-    if getattr(args, 'resume', ''):
-        start_epoch, best_metric, best_epoch = _load_resume_ckpt(
-            args.resume, model, optimizer, scheduler, device, args, ema=ema)
+    st = _setup_training_state(args, model, optimizer, scheduler, device, ema, weights_folder, exp_folder)
 
     printer = ConsolePrinter()
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        total_loss = 0.0
-        n_batches = 0
-
-        print()
-        print(printer.train_header(colored=True))
-        print(f"[Train][epoch {epoch+1}/{args.epochs}] total_batches={len(train_loader)}")
-
-        pbar = tqdm(
-            train_loader,
-            dynamic_ncols=True,
-            bar_format=printer.BAR_FORMAT,
-            leave=True,
+    for epoch in range(st["start_epoch"], args.epochs):
+        avg_loss, _, _ = _train_one_epoch_det(
+            model, train_loader, optimizer, device, epoch, args,
+            printer, st["scaler"], st["use_amp"], st["accumulate_steps"], ema,
+            loss_key=None, max_norm=1.0,
         )
-        for images, targets in pbar:
-            img_size = int(images[0].shape[-1]) if images else 0
-            images  = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
-
-            if not torch.isfinite(loss):
-                print(f"\nWARNING: non-finite loss detected at epoch {epoch+1}, skipping this batch: {loss}")
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(pg, max_norm=1.0)
-            optimizer.step()
-            if ema is not None:
-                ema.update(model)
-
-            total_loss += loss.item()
-            n_batches += 1
-
-            avg_loss = total_loss / n_batches
-            desc = printer.train_desc(epoch + 1, args.epochs, avg_loss, 0.0, img_size)
-            pbar.set_description_str(desc)
-
         scheduler.step()
-        avg_loss = total_loss / max(n_batches, 1)
-        lr_now = optimizer.param_groups[0]["lr"]
 
-        do_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == args.epochs)
+        lr_now = optimizer.param_groups[0]["lr"]
+        do_eval = ((epoch + 1) % st["eval_interval"] == 0) or ((epoch + 1) == args.epochs)
         eval_model = ema.ema if ema is not None else model
 
-        if task == "detect":
-            if do_eval:
-                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running detection evaluation...")
-                is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_detection(eval_model, val_loader, device, ann_file=args.val_ann_file,
-                                             save_dir=exp_folder if is_last else None)
-                map50    = metrics["mAP50"]
-                map50_95 = metrics["mAP50_95"]
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  mAP50={map50:.4f}  mAP50-95={map50_95:.4f}  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([epoch, avg_loss, map50, map50_95, lr_now])
-                primary = map50
-            else:
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  eval=skipped (every {eval_interval} epochs)  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([epoch, avg_loss, "", "", lr_now])
-                primary = None
+        primary = _eval_and_log_det(
+            task, do_eval, eval_model, val_loader, device, args,
+            epoch, avg_loss, lr_now, metrics_path, exp_folder,
+            evaluate_detection, evaluate_segmentation,
+            tb_writer=st["tb_writer"],
+        )
+
+        st["best_metric"], st["best_epoch"], should_stop = _save_checkpoint_and_check(
+            model, optimizer, scheduler, ema, args,
+            epoch, st["best_metric"], st["best_epoch"], primary,
+            st["early_stop"], st["last_ckpt_path"], st["best_ckpt_path"],
+        )
+        if should_stop:
+            break
+
+    # Final diagnostic plots: if early stopping triggered before the last configured
+    # epoch, the loop never ran evaluation with save_dir. Run it now.
+    last_eval_was_final = (epoch + 1 == args.epochs)
+    if not last_eval_was_final and os.path.exists(st["best_ckpt_path"]):
+        print(f"[INFO] Generating final diagnostic plots (early stop at epoch {epoch+1})...")
+        best_ckpt = torch.load(st["best_ckpt_path"], map_location=device)
+        eval_model_final = ema.ema if ema is not None else model
+        if ema is not None and best_ckpt.get("ema_state") is not None:
+            ema.load_state_dict(best_ckpt["ema_state"])
         else:
-            if do_eval:
-                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running segmentation evaluation...")
-                is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_segmentation(eval_model, val_loader, device, ann_file=args.val_ann_file,
-                                                save_dir=exp_folder if is_last else None)
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  "
-                      f"box_mAP50={metrics['box_mAP50']:.4f}  mask_mAP50={metrics['mask_mAP50']:.4f}  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([epoch, avg_loss,
-                                            metrics["box_mAP50"], metrics["box_mAP50_95"],
-                                            metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now])
-                primary = metrics["mask_mAP50"]
-            else:
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg_loss:.4f}  eval=skipped (every {eval_interval} epochs)  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([epoch, avg_loss, "", "", "", "", lr_now])
-                primary = None
+            model.load_state_dict(best_ckpt["model_state"], strict=True)
+        eval_model_final.eval()
+        if task == "detect":
+            evaluate_detection(eval_model_final, val_loader, device,
+                               ann_file=args.val_ann_file, save_dir=exp_folder)
+        else:
+            evaluate_segmentation(eval_model_final, val_loader, device,
+                                  ann_file=args.val_ann_file, save_dir=exp_folder)
 
-        if (primary is not None) and (primary > best_metric):
-            best_metric = primary
-            best_epoch = epoch
-
-        # best_metric/best_epoch 写入 checkpoint，供续训时恢复
-        ckpt = {
-            "epoch": epoch, "model_state": model.state_dict(),
-            "ema_state": ema.state_dict() if ema is not None else None,
-            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
-            "best_metric": best_metric, "best_epoch": best_epoch,
-            "args": vars(args),
-        }
-        torch.save(ckpt, last_ckpt_path)
-        if epoch == best_epoch:
-            torch.save(ckpt, best_ckpt_path)
-
-    print(f"Training done. Best metric={best_metric:.4f} at epoch={best_epoch}")
-    print(f"Last: {last_ckpt_path}  Best: {best_ckpt_path}")
+    if st["tb_writer"] is not None:
+        st["tb_writer"].close()
+    print(f"Training done. Best metric={st['best_metric']:.4f} at epoch={st['best_epoch']}")
+    print(f"Last: {st['last_ckpt_path']}  Best: {st['best_ckpt_path']}")
     if args.lr > 1e-3:
         print(f"[WARN] --lr={args.lr} may be too large for AdamW detect/segment. "
              f"Recommended: 1e-4 ~ 5e-4.")
@@ -595,6 +804,8 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
         cost_class=args.cost_class,
         cost_bbox=args.cost_bbox,
         cost_giou=args.cost_giou,
+        min_size=args.min_size,
+        max_size=args.max_size,
     )
     model.to(device)
 
@@ -615,156 +826,64 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
                   "loss_mask", "loss_dice",
                   "box_mAP50", "box_mAP50_95", "mask_mAP50", "mask_mAP50_95", "lr"]
     metrics_path = os.path.join(exp_folder, "metrics.csv")
-    # 续训时 CSV 已存在，追加数据行，不重复写表头；新训始终重建文件
     if not (getattr(args, 'resume', '') and os.path.exists(metrics_path)):
         with open(metrics_path, "w", newline="") as f:
             csv.writer(f).writerow(header)
 
-    last_ckpt_path = os.path.join(weights_folder, "last.pth")
-    best_ckpt_path = os.path.join(weights_folder, "best.pth")
-    best_metric = -1.0
-    best_epoch = -1
-    eval_interval = max(1, int(args.eval_interval))
-
-    # 续训：恢复模型/优化器/调度器状态，LR 自动从断点延续
-    start_epoch = 0
-    if getattr(args, 'resume', ''):
-        start_epoch, best_metric, best_epoch = _load_resume_ckpt(
-            args.resume, model, optimizer, scheduler, device, args, ema=ema)
+    detr_extra_keys = ("loss_ce", "loss_bbox", "loss_giou", "loss_mask", "loss_dice")
+    st = _setup_training_state(args, model, optimizer, scheduler, device, ema, weights_folder, exp_folder)
 
     printer = ConsolePrinter()
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        total_loss = 0.0
-        total_ce = 0.0
-        total_bbox = 0.0
-        total_giou = 0.0
-        total_mask = 0.0
-        total_dice = 0.0
-        n_batches = 0
-
-        print()
-        print(printer.train_header(colored=True))
-        print(f"[Train][epoch {epoch+1}/{args.epochs}] total_batches={len(train_loader)}")
-
-        pbar = tqdm(
-            train_loader,
-            dynamic_ncols=True,
-            bar_format=printer.BAR_FORMAT,
-            leave=True,
+    for epoch in range(st["start_epoch"], args.epochs):
+        avg_loss, extra_avgs, _ = _train_one_epoch_det(
+            model, train_loader, optimizer, device, epoch, args,
+            printer, st["scaler"], st["use_amp"], st["accumulate_steps"], ema,
+            loss_key="loss_total", max_norm=0.1, extra_loss_keys=detr_extra_keys,
         )
-        for images, targets in pbar:
-            img_size = int(images[0].shape[-1]) if images else 0
-            images  = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            loss_dict = model(images, targets)
-            loss = loss_dict["loss_total"]
-
-            if not torch.isfinite(loss):
-                print(f"\nWARNING: non-finite loss at epoch {epoch+1}, skipping batch: {loss}")
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(pg, max_norm=0.1)
-            optimizer.step()
-            if ema is not None:
-                ema.update(model)
-
-            total_loss += loss.item()
-            total_ce   += loss_dict["loss_ce"].item()
-            total_bbox += loss_dict["loss_bbox"].item()
-            total_giou += loss_dict["loss_giou"].item()
-            if "loss_mask" in loss_dict:
-                total_mask += loss_dict["loss_mask"].item()
-                total_dice += loss_dict["loss_dice"].item()
-            n_batches += 1
-
-            avg_loss = total_loss / n_batches
-            desc = printer.train_desc(epoch + 1, args.epochs, avg_loss, 0.0, img_size)
-            pbar.set_description_str(desc)
-
         scheduler.step()
-        avg = lambda x: x / max(n_batches, 1)
-        lr_now = optimizer.param_groups[0]["lr"]
 
-        do_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == args.epochs)
+        lr_now = optimizer.param_groups[0]["lr"]
+        do_eval = ((epoch + 1) % st["eval_interval"] == 0) or ((epoch + 1) == args.epochs)
         eval_model = ema.ema if ema is not None else model
 
+        primary = _eval_and_log_det(
+            task, do_eval, eval_model, val_loader, device, args,
+            epoch, avg_loss, lr_now, metrics_path, exp_folder,
+            evaluate_detection, evaluate_segmentation,
+            extra_avgs=extra_avgs, tb_writer=st["tb_writer"],
+        )
+
+        st["best_metric"], st["best_epoch"], should_stop = _save_checkpoint_and_check(
+            model, optimizer, scheduler, ema, args,
+            epoch, st["best_metric"], st["best_epoch"], primary,
+            st["early_stop"], st["last_ckpt_path"], st["best_ckpt_path"],
+        )
+        if should_stop:
+            break
+
+    # Final diagnostic plots: if early stopping triggered before the last configured
+    # epoch, the loop never ran evaluation with save_dir. Run it now.
+    last_eval_was_final = (epoch + 1 == args.epochs)
+    if not last_eval_was_final and os.path.exists(st["best_ckpt_path"]):
+        print(f"[INFO] Generating final diagnostic plots (early stop at epoch {epoch+1})...")
+        best_ckpt = torch.load(st["best_ckpt_path"], map_location=device)
+        eval_model_final = ema.ema if ema is not None else model
+        if ema is not None and best_ckpt.get("ema_state") is not None:
+            ema.load_state_dict(best_ckpt["ema_state"])
+        else:
+            model.load_state_dict(best_ckpt["model_state"], strict=True)
+        eval_model_final.eval()
         if task == "detect":
-            if do_eval:
-                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running DETR detection evaluation...")
-                is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_detection(eval_model, val_loader, device, ann_file=args.val_ann_file,
-                                             save_dir=exp_folder if is_last else None)
-                map50    = metrics["mAP50"]
-                map50_95 = metrics["mAP50_95"]
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  "
-                      f"ce={avg(total_ce):.4f} bbox={avg(total_bbox):.4f} giou={avg(total_giou):.4f}  "
-                      f"mAP50={map50:.4f}  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([
-                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
-                        map50, map50_95, lr_now,
-                    ])
-                primary = map50
-            else:
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  eval=skipped  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([
-                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
-                        "", "", lr_now,
-                    ])
-                primary = None
-        else:  # segment
-            if do_eval:
-                print(f"[Eval ][epoch {epoch+1}/{args.epochs}] running DETR segmentation evaluation...")
-                is_last = (epoch + 1) == args.epochs
-                metrics = evaluate_segmentation(eval_model, val_loader, device, ann_file=args.val_ann_file,
-                                                save_dir=exp_folder if is_last else None)
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  "
-                      f"box_mAP50={metrics['box_mAP50']:.4f}  box_mAP50_95={metrics['box_mAP50_95']:.4f}  "
-                      f"mask_mAP50={metrics['mask_mAP50']:.4f}  mask_mAP50_95={metrics['mask_mAP50_95']:.4f}  "
-                      f"lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([
-                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
-                        avg(total_mask), avg(total_dice),
-                        metrics["box_mAP50"], metrics["box_mAP50_95"],
-                        metrics["mask_mAP50"], metrics["mask_mAP50_95"], lr_now,
-                    ])
-                # Use box_mAP50 + mask_mAP50 so best.pth tracks progress even when mask AP = 0
-                primary = metrics["box_mAP50"] + metrics["mask_mAP50"]
-            else:
-                print(f"[epoch {epoch+1}/{args.epochs}] loss={avg(total_loss):.4f}  eval=skipped  lr={lr_now:.6f}")
-                with open(metrics_path, "a", newline="") as f:
-                    csv.writer(f).writerow([
-                        epoch, avg(total_loss), avg(total_ce), avg(total_bbox), avg(total_giou),
-                        avg(total_mask), avg(total_dice),
-                        "", "", "", "", lr_now,
-                    ])
-                primary = None
+            evaluate_detection(eval_model_final, val_loader, device,
+                               ann_file=args.val_ann_file, save_dir=exp_folder)
+        else:
+            evaluate_segmentation(eval_model_final, val_loader, device,
+                                  ann_file=args.val_ann_file, save_dir=exp_folder)
 
-        if (primary is not None) and (primary > best_metric):
-            best_metric = primary
-            best_epoch = epoch
-
-        # best_metric/best_epoch 写入 checkpoint，供续训时恢复
-        ckpt = {
-            "epoch": epoch, "model_state": model.state_dict(),
-            "ema_state": ema.state_dict() if ema is not None else None,
-            "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
-            "best_metric": best_metric, "best_epoch": best_epoch,
-            "args": vars(args),
-        }
-        torch.save(ckpt, last_ckpt_path)
-        if epoch == best_epoch:
-            torch.save(ckpt, best_ckpt_path)
-
-    print(f"Training done. Best metric={best_metric:.4f} at epoch={best_epoch}")
-    print(f"Last: {last_ckpt_path}  Best: {best_ckpt_path}")
+    if st["tb_writer"] is not None:
+        st["tb_writer"].close()
+    print(f"Training done. Best metric={st['best_metric']:.4f} at epoch={st['best_epoch']}")
+    print(f"Last: {st['last_ckpt_path']}  Best: {st['best_ckpt_path']}")
     if args.lr > 1e-3:
         print(f"[WARN] --lr={args.lr} may be too large for AdamW DETR. "
               f"Recommended: 1e-4 ~ 5e-4.")
@@ -825,6 +944,18 @@ if __name__ == '__main__':
     parser.add_argument('--device',     type=str,   default='cuda:0')
     parser.add_argument('--eval-interval', type=int, default=1,
                         help='[detect/segment] Run evaluation every N epochs (last epoch is always evaluated)')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Early stopping patience: stop if metric does not improve for N epochs. '
+                             'Set 0 to disable. Default: 10.')
+    parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable AMP (Automatic Mixed Precision) training. '
+                             'Default: on. Use --no-amp to disable.')
+    parser.add_argument('--accumulate-steps', type=int, default=1,
+                        help='Gradient accumulation steps. Effective batch size = batch-size * accumulate-steps. '
+                             'Default: 1 (no accumulation).')
+    parser.add_argument('--tensorboard', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable TensorBoard logging to exp_folder/tb_logs/. '
+                             'Default: on. Use --no-tensorboard to disable.')
 
     # ---- resume (detect / segment / detr_detect / detr_segment only) ----
     parser.add_argument('--resume', type=str, default='',
@@ -865,6 +996,10 @@ if __name__ == '__main__':
                         help='[detr] Matching cost weight: L1 bbox')
     parser.add_argument('--cost-giou',      type=float, default=2.0,
                         help='[detr] Matching cost weight: GIoU')
+    parser.add_argument('--min-size',       type=int,   default=800,
+                        help='[detr] Minimum image size for input transform (default: 800)')
+    parser.add_argument('--max-size',       type=int,   default=1333,
+                        help='[detr] Maximum image size for input transform (default: 1333)')
 
     opt = parser.parse_args()
     main(opt)
