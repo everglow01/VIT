@@ -4,7 +4,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white">
   <img alt="Tasks" src="https://img.shields.io/badge/Tasks-Classify%20%7C%20Detect%20%7C%20Segment%20%7C%20DETR-2EA44F">
-  <img alt="EMA" src="https://img.shields.io/badge/Training-EMA%20%7C%20Warmup%20%7C%20Aux%20Loss-orange">
+  <img alt="Training" src="https://img.shields.io/badge/Training-EMA%20%7C%20AMP%20%7C%20GradAccum%20%7C%20EarlyStop-orange">
   <img alt="License Notice" src="https://img.shields.io/badge/Usage-Non--Commercial%20Only-8A2BE2">
 </p>
 
@@ -42,15 +42,15 @@ All outputs (metrics CSVs, plots, checkpoints) land consistently in `run/train/e
 |---------|---------|
 | **Multiple backbones** | ViT (base/large/huge) and Swin (tiny/small/base) |
 | **Five tasks, one entry point** | `classify` · `detect` · `segment` · `detr_detect` · `detr_segment` |
+| **Dynamic-resolution Swin** | Padded windowed attention + on-the-fly shifted-window masks allow non-224 inputs; DETR path defaults to 800×1333 |
 | **Deformable DETR Encoder** | `DeformableAttention` replaces encoder self-attention; no stacking conflict with SCSA |
-| **DN-DETR denoising** | Noised GT queries during training accelerate convergence vs vanilla DETR |
-| **Decoder auxiliary losses** | 4-layer decoder generates 4 independent predictions; each receives its own Hungarian match + loss |
-| **EMA weights** | Shadow model updated every step; used for evaluation and saved in checkpoints |
-| **LR warmup + cosine decay** | Linear ramp then cosine annealing; configurable via `--warmup-epochs` |
-| **Differential LR** | Backbone trains at `lr × scale` (default 0.1×); head at full LR |
-| **Weight decay exclusion** | Biases and 1-D norm params (LayerNorm/BN γ, β) get `weight_decay=0` automatically |
+| **DN-DETR denoising + Aux losses** | Noised GT queries accelerate convergence; 4-layer decoder gives 4 independently-matched losses |
+| **EMA + Warmup + Cosine decay** | Shadow model (`--ema-decay`) · linear warmup (`--warmup-epochs`) · cosine annealing to `lr × lrf` |
+| **Differential LR + WD exclusion** | Backbone at `lr × scale`; biases and 1-D norm params get `weight_decay=0` automatically |
+| **AMP + Gradient accumulation** | `--amp` (CUDA only) and `--accumulate-steps` for faster training and larger effective batch |
+| **EarlyStopping + TensorBoard** | `--patience N` stops stale runs and still emits final diagnostic plots; `--tensorboard` logs live to `tb_logs/` |
 | **Plug-in attention modules** | 20 attention modules in `AttentionModules/` (SCSA, DANet, DeformableAttention, CBAM, SE, CA, …) |
-| **Checkpoint resume** | Restores model, optimizer, scheduler, EMA in one `--resume` flag |
+| **Checkpoint resume** | Restores model, optimizer, scheduler, EMA, AMP scaler in one `--resume` flag |
 | **COCO mAP evaluation** | mAP@0.5 and mAP@0.5:0.95 via pycocotools |
 | **ONNX export** | Task auto-detected; verified against PyTorch outputs |
 
@@ -63,7 +63,7 @@ All outputs (metrics CSVs, plots, checkpoints) land consistently in `run/train/e
 ```mermaid
 graph LR
     subgraph Backbone
-        A[Input 224×224] --> B[Swin / ViT]
+        A[Input H×W<br/>224 classify / 800×1333 DETR] --> B[Swin / ViT]
     end
     subgraph Neck
         B --> C[FPN\nP3 · P4 · P5]
@@ -168,45 +168,41 @@ These modules are implemented and importable but not yet wired into a default ta
 
 ## 🔥 Training Optimizations
 
-Five best-practices are implemented and can all be controlled via CLI arguments:
+All of the following are on by default and controllable via CLI arguments.
 
-### 1 · LR Warmup (`--warmup-epochs`, default 5)
+### 1 · LR schedule — Warmup + Cosine
 
-Linearly ramps LR from 0 to `--lr` over the first N epochs, preventing instability from random-init heads in the early phase. After warmup, cosine annealing takes over.
+`--warmup-epochs N` (default 5) linearly ramps LR from `1/N × lr` to `lr`, then cosine-anneals to `lr × lrf`. This prevents early instability from random-init heads.
 
-### 2 · Decoder Auxiliary Losses
+### 2 · Decoder Auxiliary Losses (DETR)
 
-The 4-layer DETR decoder iterates layer-by-layer. Each intermediate layer generates its own `(pred_logits, pred_boxes)` pair, receives a full Hungarian match against GT, and contributes to the total loss:
+Each of the 4 decoder layers emits its own `(pred_logits, pred_boxes)`, runs a full Hungarian match, and contributes to the total loss:
 
 ```
 loss_total += Σ (loss_ce_aux_i + loss_bbox_aux_i + loss_giou_aux_i)   i = 0,1,2
             + loss_ce + loss_bbox + loss_giou + loss_dn_*
 ```
 
-This provides 4× denser gradient signal compared to supervising only the last layer.
+4× denser gradient signal vs supervising only the last layer.
 
-### 3 · Differential LR (`--backbone-lr-scale`, default 0.1)
+### 3 · Differential LR + Weight-Decay Exclusion
 
-Pre-trained backbone parameters are updated at a lower rate than the randomly-initialised head:
+- `--backbone-lr-scale` (default 0.1): backbone trains at `lr × scale`, head at full `lr`.
+- Biases and 1-D params (LayerNorm / BN γ, β) are placed in a `weight_decay=0` group automatically — standard Transformer practice (GPT-2, ViT).
 
-```
-head     parameters → lr  =  --lr
-backbone parameters → lr  =  --lr × --backbone-lr-scale
-```
+### 4 · EMA — Exponential Moving Average (`--ema-decay`, default 0.9999)
 
-### 4 · Weight Decay Exclusion
+`shadow_w = d · shadow_w + (1 − d) · model_w`, with `d = min(decay, (1 + n) / (10 + n))` warmup so early noisy weights don't pollute the average. The EMA model is used for **all validation** and saved under `ema_state`. Set `--ema-decay 0` to disable.
 
-Bias terms and 1-D parameters (LayerNorm / BatchNorm γ, β) are automatically placed in a separate parameter group with `weight_decay = 0`. Only weight matrices and conv filters receive L2 regularisation — following standard Transformer training practice (GPT-2, ViT, etc.).
+### 5 · AMP + Gradient Accumulation
 
-### 5 · EMA — Exponential Moving Average (`--ema-decay`, default 0.9999)
+- `--amp` / `--no-amp` (default on, CUDA-only) — `torch.cuda.amp.GradScaler`-backed mixed precision.
+- `--accumulate-steps K` (default 1) — effective batch = `batch_size × K`, lets you train DETR on small GPUs without shrinking the math batch size.
 
-A shadow copy of the model is maintained:
+### 6 · EarlyStopping + TensorBoard
 
-```
-shadow_w  =  d · shadow_w  +  (1 − d) · model_w
-```
-
-where `d = min(decay, (1 + n) / (10 + n))` warms up over the first few hundred steps to avoid early poor weights polluting the average. The EMA model is used for **all validation** and is saved in `best.pth` / `last.pth` under the key `ema_state`. Set `--ema-decay 0` to disable.
+- `--patience N` (default 10, `0` disables) monitors the primary validation metric; when triggered, a final evaluation run is still performed so PR curves / confusion matrices / scale analysis are saved.
+- `--tensorboard` / `--no-tensorboard` (default on) writes `Train/loss`, `LR`, `Val/*` metrics to `<exp_folder>/tb_logs/`.
 
 ---
 
@@ -356,7 +352,7 @@ python train.py \
 
 ### 4) DN-DETR Detection
 
-End-to-end detection — no anchors, no proposals.
+End-to-end detection — no anchors, no proposals. Default input transform is `--min-size 800 --max-size 1333`; Swin handles it via dynamic windowed attention. Override with e.g. `--min-size 512 --max-size 512` for memory-tight GPUs.
 
 ```bash
 python train.py \
@@ -437,20 +433,23 @@ python train.py \
 | `--warmup-epochs` | `5` | all | Linear LR warmup before cosine decay; `0` to disable |
 | `--backbone-lr-scale` | `0.1` | all | Backbone LR = `lr × scale`; applies when backbone not fully frozen |
 | `--ema-decay` | `0.9999` | all | EMA coefficient; `0` to disable |
+| `--amp` / `--no-amp` | on | all | Mixed-precision training (CUDA only) |
+| `--accumulate-steps` | `1` | all | Gradient accumulation; effective batch = `batch_size × N` |
+| `--patience` | `10` | all | EarlyStopping patience on primary val metric; `0` disables |
+| `--tensorboard` / `--no-tensorboard` | on | all | Log to `<exp_folder>/tb_logs/` |
 | `--model` | `swin_base_…` | all | Backbone name (see backbone list) |
 | `--weights` | — | all | Pre-trained backbone weights path |
 | `--freeze-layers` | `none` | all | `all` / `partial` (DETR: keep stage2+3) / `none` |
 | `--device` | `cuda:0` | all | Device string |
 | `--eval-interval` | `1` | detect/segment/detr_* | Run evaluation every N epochs |
 | `--resume` | — | detect/segment/detr_* | Checkpoint path to resume from |
+| `--min-size` / `--max-size` | `800` / `1333` | detr_* | Image transform size; any shape supported (Swin dynamic-res) |
 | `--num-queries` | `100` | detr_* | Number of object queries |
 | `--d-model` | `256` | detr_* | Transformer hidden dimension |
 | `--num-enc-layers` | `4` | detr_* | Encoder depth |
 | `--num-dec-layers` | `4` | detr_* | Decoder depth (each layer also produces auxiliary loss) |
 | `--num-dn-groups` | `2` | detr_* | DN denoising groups |
-| `--cost-class` | `1.0` | detr_* | Hungarian matching weight: classification |
-| `--cost-bbox` | `5.0` | detr_* | Hungarian matching weight: L1 bbox |
-| `--cost-giou` | `2.0` | detr_* | Hungarian matching weight: GIoU |
+| `--cost-class` / `--cost-bbox` / `--cost-giou` | `1.0` / `5.0` / `2.0` | detr_* | Hungarian matching weights (class / L1 bbox / GIoU) |
 
 ### Inference arguments
 
@@ -594,9 +593,12 @@ All outputs land under `run/train/expN/`:
 | `scale_analysis.png` | Small/medium/large object breakdown |
 | `mask_analysis/` | Mask IoU analysis (segmentation only) |
 
+Plus `tb_logs/` (TensorBoard event files) when `--tensorboard` is on.
+
 Prediction output: `run/predict/expN/predictions.txt` (TSV format).
 
 > When resuming, `metrics.csv` is **appended** — final plots cover the complete training history from epoch 0.
+> DETR inference automatically reads `min_size` / `max_size` from the checkpoint's saved args. Older checkpoints without these fields fall back to `224/224`, matching their original training resolution.
 
 ---
 
