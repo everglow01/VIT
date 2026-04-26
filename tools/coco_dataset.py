@@ -110,12 +110,15 @@ def build_coco_dataloaders(
     val_ann_file: str,
     batch_size: int = 4,
     load_masks: bool = False,
-    num_workers: int = 4,
+    num_workers: int = -1,
 ):
     """
     Returns (train_loader, val_loader, num_classes).
     Images are converted to tensors; normalization is handled inside the model transform.
     """
+    if num_workers < 0:
+        num_workers = min(os.cpu_count(), batch_size if batch_size > 1 else 0, 8)
+
     to_tensor = T.ToTensor()
 
     train_ds = CocoDataset(train_img_dir, train_ann_file, load_masks=load_masks, transforms=to_tensor)

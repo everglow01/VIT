@@ -273,7 +273,8 @@ def _train_classify(args, device, exp_folder, weights_folder):
     train_loader, val_loader = build_vit_dataloaders(
         train_images_path, train_images_label,
         val_images_path, val_images_label,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        num_workers=None if args.num_workers == -1 else args.num_workers,
     )
 
     model = build_model_and_prepare(args, device, num_classes)
@@ -677,6 +678,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
         val_ann_file=args.val_ann_file,
         batch_size=args.batch_size,
         load_masks=load_masks,
+        num_workers=args.num_workers,
     )
     print(f"[INFO] COCO dataset: {num_classes} foreground classes.")
 
@@ -897,12 +899,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument('--task', type=str, default='segment',
+    parser.add_argument('--task', type=str, default='detect',
                         choices=['classify', 'detect', 'segment', 'detr_detect', 'detr_segment'],
                         help='Task type: classify | detect | segment | detr_detect | detr_segment')
 
     # ---- common ----
-    parser.add_argument('--epochs',     type=int,   default=100)
+    parser.add_argument('--epochs',     type=int,   default=20)
     parser.add_argument('--batch-size', type=int,   default=4)
     parser.add_argument('--lr',         type=float, default=0.001,
                         help='Learning rate. Recommended: 0.001 for detection/segmentation with AdamW; 0.01 for classification with SGD.')
@@ -957,6 +959,9 @@ if __name__ == '__main__':
                         help='Enable TensorBoard logging to exp_folder/tb_logs/. '
                              'Default: on. Use --no-tensorboard to disable.')
 
+    parser.add_argument('--num-workers', type=int, default=-1,
+                        help='DataLoader worker processes. -1 = auto (min(cpu_count, batch_size, 8)).')
+
     # ---- resume (detect / segment / detr_detect / detr_segment only) ----
     parser.add_argument('--resume', type=str, default='',
                         help='Path to a checkpoint (.pth/.pt) to resume training from. '
@@ -970,13 +975,13 @@ if __name__ == '__main__':
                         help='[classify] Dataset root directory (ImageFolder style)')
 
     # ---- detect / segment only ----
-    parser.add_argument('--train-img-dir',  type=str, default="data/TOMATO.v7i.coco-segmentation/images/train",
+    parser.add_argument('--train-img-dir',  type=str, default="data/uadetrac-1/train",
                         help='[detect/segment] Training images directory')
-    parser.add_argument('--train-ann-file', type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_train_fixed.json",
+    parser.add_argument('--train-ann-file', type=str, default="data/uadetrac-1/train/_annotations.coco.json",
                         help='[detect/segment] Training COCO annotation JSON')
-    parser.add_argument('--val-img-dir',    type=str, default="data/TOMATO.v7i.coco-segmentation/images/valid",
+    parser.add_argument('--val-img-dir',    type=str, default="data/uadetrac-1/valid",
                         help='[detect/segment] Validation images directory')
-    parser.add_argument('--val-ann-file',   type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_valid_fixed.json",
+    parser.add_argument('--val-ann-file',   type=str, default="data/uadetrac-1/valid/_annotations.coco.json",
                         help='[detect/segment] Validation COCO annotation JSON')
 
     # ---- DETR only (ignored by other tasks) ----

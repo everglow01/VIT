@@ -16,7 +16,7 @@ from tools.utils import get_model_factory, extract_state_dict, apply_nms
 IMG_SIZE = 224
 MEAN = (0.5, 0.5, 0.5)
 STD  = (0.5, 0.5, 0.5)
-CONF_THRESH = 0.5
+CONF_THRESH = 0.85
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp",
             ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
 
@@ -424,12 +424,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument("--task", type=str, default="segment",
+    parser.add_argument("--task", type=str, default="detect",
                         choices=["classify", "detect", "segment", "detr_detect", "detr_segment"])
 
     # ---- common ----
-    parser.add_argument("--data",       type=str, default="data/TOMATO.v7i.coco-segmentation/images/valid")
-    parser.add_argument("--weights",    type=str, default="run/train/exp37/weights/best.pth")
+    parser.add_argument("--data",       type=str, default="data/uadetrac-1/test")
+    parser.add_argument("--weights",    type=str, default="run/train/exp40/weights/best.pth")
     parser.add_argument("--model-name", type=str, default="swin_base_patch4_window7_224",
                         help="Backbone name used during training. "
                              "ViT: vit_base_patch16_224_in21k | vit_large_patch16_224_in21k. "
@@ -441,7 +441,7 @@ if __name__ == "__main__":
     # 用户可以用 --no-draw 来关闭
     parser.add_argument("--num-classes", type=int, default=3,
                         help="Required for detect/segment; optional for classify")
-    parser.add_argument("--ann-file", type=str, default="data/TOMATO.v7i.coco-segmentation/annotations/_annotations_valid_fixed.json",
+    parser.add_argument("--ann-file", type=str, default="data/uadetrac-1/train/_annotations.coco.json",
                         help="Optional COCO annotation JSON for detect/segment class names")
 
     # ---- NMS (optional post-processing) ----
