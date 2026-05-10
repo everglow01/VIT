@@ -265,7 +265,7 @@ def _compute_gflops(model, inputs):
     model.eval()
     try:
         try:
-            from torch.utils.flop_counter import FlopCounterMode
+            from torch.utils.flop_counter import FlopCounterMode # type: ignore # above torch2.1 
             with torch.no_grad(), FlopCounterMode(model, display=False) as fc:
                 model(*inputs)
             return fc.get_total_flops() / 1e9
