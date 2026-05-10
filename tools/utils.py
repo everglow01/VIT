@@ -233,6 +233,60 @@ class EarlyStopping:
         return False
 
 
+def print_model_summary(model, model_name: str, task: str, min_size: int = 800):
+    """
+    Ultralytics-style one-line model summary.
+    Tries torch.utils.flop_counter (PyTorch 2.1+) first, falls back to thop.
+    """
+    n_layers = len(list(model.modules()))
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    device = next(model.parameters()).device
+    if task == "classify":
+        inputs = (torch.randn(1, 3, 224, 224, device=device),)
+    else:
+        inputs = ([torch.randn(3, min_size, min_size, device=device)],)
+
+    gflops = _compute_gflops(model, inputs)
+
+    parts = [
+        f"[Model] {model_name}",
+        f"{n_layers} layers",
+        f"{n_params:,} params",
+        f"{n_trainable:,} trainable",
+        f"{gflops:.1f} GFLOPs" if gflops is not None else "GFLOPs n/a",
+    ]
+    print(" | ".join(parts))
+
+
+def _compute_gflops(model, inputs):
+    was_training = model.training
+    model.eval()
+    try:
+        try:
+            from torch.utils.flop_counter import FlopCounterMode
+            with torch.no_grad(), FlopCounterMode(model, display=False) as fc:
+                model(*inputs)
+            return fc.get_total_flops() / 1e9
+        except ImportError:
+            pass
+
+        try:
+            import thop
+            with torch.no_grad():
+                flops, _ = thop.profile(model, inputs=inputs, verbose=False)
+            return flops / 1e9
+        except ImportError:
+            print("[Model] GFLOPs unavailable. Install thop: pip install thop")
+            return None
+        except Exception as e:
+            print(f"[Model] GFLOPs computation failed: {type(e).__name__}: {e}")
+            return None
+    finally:
+        model.train(was_training)
+
+
 # 控制台打印参数类
 class ConsolePrinter:
     """

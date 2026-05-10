@@ -15,12 +15,14 @@ dist/
 build/
 .env
 
+
 # IDE
 .vscode/
 .idea/
 
 # local notes
 CLAUDE.md
+codex.md
 
 # local stats
 class_counts.csv
@@ -35,3 +37,4 @@ detr.md
 REVIEW_FINDINGS.md
 demo_image/
 RELEASE_NOTES.md
+.gitignore

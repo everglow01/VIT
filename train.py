@@ -12,7 +12,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 from tools.my_dataset import build_vit_dataloaders
 from tools.utils import (read_split_data, train_one_epoch, evaluate, ConsolePrinter,
                          get_model_factory, extract_state_dict, make_cosine_lr,
-                         make_param_groups, ModelEMA, EarlyStopping)
+                         make_param_groups, ModelEMA, EarlyStopping, print_model_summary)
 from tools.create_exp_folder import create_exp_folder
 from tools.plot_metrics import plot_from_metrics_csv, plot_val_prf_curves, save_confusion_matrices
 
@@ -278,6 +278,7 @@ def _train_classify(args, device, exp_folder, weights_folder):
     )
 
     model = build_model_and_prepare(args, device, num_classes)
+    print_model_summary(model, args.model, args.task)
 
     pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=5e-5)
     optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=0.0)
@@ -697,6 +698,7 @@ def _train_detect_segment(args, device, exp_folder, weights_folder, task: str):
             freeze_backbone=(args.freeze_layers != "none"),
         )
     model.to(device)
+    print_model_summary(model, args.model, args.task, min_size=args.min_size)
 
     pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=0.05)
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.0)
@@ -810,6 +812,7 @@ def _train_detr(args, device, exp_folder, weights_folder, task: str):
         max_size=args.max_size,
     )
     model.to(device)
+    print_model_summary(model, args.model, args.task, min_size=args.min_size)
 
     pg = make_param_groups(model, args.lr, args.backbone_lr_scale, weight_decay=0.05)
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=0.0)
@@ -899,7 +902,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # ---- task ----
-    parser.add_argument('--task', type=str, default='detect',
+    parser.add_argument('--task', type=str, default='detr_segment',
                         choices=['classify', 'detect', 'segment', 'detr_detect', 'detr_segment'],
                         help='Task type: classify | detect | segment | detr_detect | detr_segment')
 
